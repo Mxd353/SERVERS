@@ -151,7 +151,7 @@ void ServerInstance::SetKvMigrationRing(
 void ServerInstance::HotReport(const std::string &key, std::string_view value,
                                int count) {
   std::lock_guard<std::mutex> lock(hot_keys_mutex_);
-  std::cout << "[HOT] k: " << key << " | v: " << value << "\n";
+
   if (confirmed_hot_keys_.count(key)) {
     std::cout << "This is a confirmed hot key.\n";
     return;
@@ -171,8 +171,8 @@ void ServerInstance::HotReport(const std::string &key, std::string_view value,
   payload->request_id = generate_request_id();
   payload->dev_id = rack_id_;
 
-  std::memset(payload->key.data(), 0, KEY_LENGTH);
-  std::memcpy(payload->key.data(), key.data(), KEY_LENGTH);
+  std::memset(payload->key_hot.data(), 0, KEY_LENGTH);
+  std::memcpy(payload->key_hot.data(), key.data(), KEY_LENGTH);
   std::memcpy(payload->value1.data(), value.data(), VALUE_LENGTH * 4);
 
   payload->count = count;
@@ -188,31 +188,80 @@ void ServerInstance::HotReport(const std::string &key, std::string_view value,
   }
 }
 
-void ServerInstance::HandleKVMigration(struct KV_Migration *kv_migration_hdr,
-                                       uint8_t *data, size_t data_len) {
-  if (!kv_migration_in_.exchange(true))
-    std::cout << "[KVMigration] Received KVMigration\n";
+std::shared_ptr<MigrationStateMachine::DestinationMigrationMeta>
+ServerInstance::EnsureMigrationMeta(uint32_t migration_id, uint8_t source_rack,
+                                    uint16_t total_chunks,
+                                    std::vector<std::string> &&initial_keys) {
+  auto meta = fsm_.getDestinationMigrationMeta(migration_id);
+  if (meta) return meta;
 
-  auto old_id = kv_migration_in_id_.exchange(kv_migration_hdr->migration_id);
-  if (old_id != 0 && old_id != kv_migration_hdr->migration_id) {
-    std::cerr << "Migration ID mismatch or non-zero migration ID detected"
-              << std::endl;
-    return;
-  }
-  std::vector<uint8_t> compressed_data(data, data + data_len);
-  std::vector<KVPair> decompressed_pairs = DecompressKvPairs(compressed_data);
-
-  {
-    std::unique_lock lock(kv_cache_mutex_);
-    for (const auto &kv : decompressed_pairs) {
-      kv_migration_in_cache_[kv.first] = kv.second;
+  const auto &active = fsm_.getActiveDestinationMigrations();
+  if (active.find(migration_id) == active.end()) {
+    fsm_.addDestinationMode(migration_id, source_rack, std::move(initial_keys));
+    meta = fsm_.getDestinationMigrationMeta(migration_id);
+    if (meta) {
+      meta->total_chunks = total_chunks;
     }
   }
-  if (kv_migration_in_cache_.size() == kv_migration_hdr->total_len ||
-      kv_migration_hdr->is_last_chunk == 1) {
-    redis_->mset(kv_migration_in_cache_.begin(), kv_migration_in_cache_.end());
-    std::unique_lock lock(kv_cache_mutex_);
-    kv_migration_in_cache_.clear();
+  return meta;
+}
+
+void ServerInstance::HandleKVMigration(struct KV_Migration *kv_migration_hdr,
+                                       uint8_t *data, size_t data_len) {
+  uint32_t migration_id = ntohl(kv_migration_hdr->migration_id);
+  uint8_t source_rack = kv_migration_hdr->src_rack_id;
+  uint16_t chunk_index = ntohs(kv_migration_hdr->chunk_index);
+  uint16_t total_chunks = ntohs(kv_migration_hdr->total_chunks);
+
+  std::vector<uint8_t> compressed_data(data, data + data_len);
+  std::vector<KVPair> decompressed_pairs;
+  try {
+    decompressed_pairs = DecompressKvPairs(compressed_data);
+  } catch (const std::exception &e) {
+    std::cerr << "Decompression failed: " << e.what() << "\n";
+    return;
+  }
+
+  redis_->mset(decompressed_pairs.begin(), decompressed_pairs.end());
+
+  std::vector<std::string> keys_cache;
+  keys_cache.reserve(decompressed_pairs.size());
+  for (const auto &kv : decompressed_pairs) {
+    keys_cache.emplace_back(kv.first);
+  }
+
+  auto meta = EnsureMigrationMeta(migration_id, source_rack, total_chunks,
+                                  std::move(keys_cache));
+  if (!meta) {
+    std::cerr << "[Error] Failed to obtain migration meta\n";
+    return;
+  }
+
+  if (chunk_index >= meta->total_chunks) {
+    std::cerr << "[Warning] Invalid chunk index " << chunk_index << "\n";
+    return;
+  }
+  if (!meta->received_chunks.insert(chunk_index).second) {
+    std::cerr << "[Info] Duplicate chunk " << chunk_index << " for migration "
+              << migration_id << "\n";
+    return;
+  }
+
+  if (meta->keys) {
+    meta->keys->reserve(meta->keys->size() + decompressed_pairs.size());
+    for (auto &kv : decompressed_pairs)
+      meta->keys->emplace_back(std::move(kv.first));
+  }
+
+  if (kv_migration_hdr->is_last_chunk &&
+      meta->received_chunks.size() != meta->total_chunks) {
+    std::cerr << "Last chunk arrived but some chunks are still missing.\n";
+  }
+
+  if (meta->received_chunks.size() == meta->total_chunks) {
+    std::cout << "KV migration " << migration_id
+              << " completed successfully.\n";
+    fsm_.transitionTo(MigrationStateMachine::State::DONE, migration_id);
   }
 }
 
@@ -321,7 +370,7 @@ bool ServerInstance::SendPacket(const std::vector<uint8_t> &packet) {
   dest_addr.sll_family = AF_PACKET;
   dest_addr.sll_ifindex = ifindex_;
   dest_addr.sll_halen = ETH_ALEN;
-  memcpy(dest_addr.sll_addr, eth_hdr->h_dest, ETH_ALEN);
+  memcpy(dest_addr.sll_addr, eth_hdr->h_dest, 6);
 
   ssize_t bytes_sent = sendto(sockfd_, packet.data(), packet.size(), 0,
                               (struct sockaddr *)&dest_addr, addrlen);
@@ -400,8 +449,8 @@ void ServerInstance::HandleHotReply(const std::vector<uint8_t> &packet) {
       reinterpret_cast<const struct ReportHotKey *>(packet.data() + ETH_HLEN +
                                                     IPV4_HDR_LEN);
 
-  std::string key_new(hot_reply_hdr->key.data(), KEY_LENGTH);
-  std::string key_replay(hot_reply_hdr->key_replay.data(), KEY_LENGTH);
+  std::string key_new(hot_reply_hdr->key_hot.data(), KEY_LENGTH);
+  std::string key_replay(hot_reply_hdr->key_replace.data(), KEY_LENGTH);
 
   std::lock_guard<std::mutex> lock(hot_keys_mutex_);
   if (pending_hot_keys_.erase(key_new)) {
@@ -416,23 +465,22 @@ void ServerInstance::HandleHotReply(const std::vector<uint8_t> &packet) {
   }
 }
 
-void ServerInstance::onStateChange(
-    MigrationStateMachine::State new_state,
-    std::shared_ptr<const MigrationStateMachine::MigrationMeta> meta) {
+void ServerInstance::onStateChange(MigrationStateMachine::State new_state,
+                                   uint32_t migration_id) {
   switch (new_state) {
     case MigrationStateMachine::State::NO:
-      std::cout << "Migration reset for ID: " << meta->id << ".\n";
+      std::cout << "Migration reset for ID: " << migration_id << ".\n";
       break;
-    case MigrationStateMachine::State::READY:
-      std::cout << "Migration READY for ID: " << meta->id << ".\n";
+    case MigrationStateMachine::State::PREPARING:
+      std::cout << "Migration PREPARING for ID: " << migration_id << ".\n";
       SendMigrationReady();
       break;
-    case MigrationStateMachine::State::START:
-      std::cout << "Migration STARTED for ID: " << meta->id << ".\n";
+    case MigrationStateMachine::State::TRANSFERRING:
+      std::cout << "Migration TRANSFERRING for ID: " << migration_id << ".\n";
       StartMigration();
       break;
     case MigrationStateMachine::State::DONE:
-      std::cout << "Migration DONE for ID: " << meta->id << ".\n";
+      std::cout << "Migration DONE for ID: " << migration_id << ".\n";
       break;
   }
 }
@@ -442,11 +490,13 @@ void ServerInstance::HandleMigrationInfo(const std::vector<uint8_t> &packet) {
       reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
                                                      IPV4_HDR_LEN);
   switch (migration_info_hdr->migration_status) {
-    case MIGRATION_READY:
+    case MIGRATION_PREPARING:
       HandleMigrationReady(packet);
       break;
-    case MIGRATION_START:
-      HandleMigrationStart(migration_info_hdr->request_id);
+    case MIGRATION_TRANSFERRING:
+      if (SendAsk(migration_info_hdr->request_id, controller_ip_in_))
+        if (!fsm_.transitionTo(MigrationStateMachine::State::TRANSFERRING))
+          perror("Set TRANSFERRING error");
       break;
     case MIGRATION_DONE:
 
@@ -507,47 +557,49 @@ void ServerInstance::HandleMigrationReady(const std::vector<uint8_t> &packet) {
       }
       exponentialBackoff(attempt);
     }
-    return;
   } else {
     std::vector<std::string> selected;
+    selected.reserve(confirmed_hot_keys_.size());
     std::hash<std::string> hasher;
-    for (const auto &key : confirmed_hot_keys_) {
+    for (auto &key : confirmed_hot_keys_) {
       if ((hasher(key) % 2) == 0) {
-        selected.push_back(key);
+        selected.emplace_back(std::move(key));
       }
     }
 
-    if (!fsm_.setReady(migration_info_hdr->migration_id,
-                       migration_info_hdr->dst_rack_id, selected)) {
+    if (!fsm_.startSourceMode(ntohl(migration_info_hdr->migration_id),
+                              migration_info_hdr->dst_rack_id,
+                              std::move(selected))) {
       perror("Set READY with meta error");
     }
   }
 }
 
 void ServerInstance::SendMigrationReady() {
-  auto meta = fsm_.getMigrationMeta();
+  auto meta = fsm_.getSourceMigrationMeta();
   const auto &keys = *meta->keys;
   size_t total_keys = keys.size();
-  size_t total_batches = (total_keys + BATCH_SIZE - 1) / BATCH_SIZE;
+  size_t total_chunks = (total_keys + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-  for (size_t batch_index = 0; batch_index < total_batches; ++batch_index) {
-    size_t start = batch_index * BATCH_SIZE;
-    size_t end = std::min(start + BATCH_SIZE, total_keys);
-    size_t current_batch_size = end - start;
+  for (size_t chunk_index = 0; chunk_index < total_chunks; ++chunk_index) {
+    size_t start = chunk_index * CHUNK_SIZE;
+    size_t end = std::min(start + CHUNK_SIZE, total_keys);
+    size_t current_chunk_size = end - start;
 
     auto payload = std::make_unique<KeyMigrationReady>();
     payload->request_id = generate_request_id();
-    payload->migration_id = meta->id;
-    payload->migration_status = MIGRATION_READY;
-    payload->total_len = htons(total_keys);
-    payload->current_offset = htons(start);
-    payload->is_final = (batch_index == total_batches - 1) ? 1 : 0;
+    payload->migration_id = htonl(meta->id);
+    payload->migration_status = MIGRATION_PREPARING;
+    payload->chunk_index = htons(chunk_index);
+    payload->total_chunks = htons(total_chunks);
+    payload->chunk_size = htons(current_chunk_size);
+    payload->is_final = (chunk_index == total_chunks - 1) ? 1 : 0;
 
-    for (size_t i = 0; i < current_batch_size; ++i) {
+    for (size_t i = 0; i < current_chunk_size; ++i) {
       const std::string &key = keys[start + i];
       std::memset(payload->keys[i].data(), 0, KEY_LENGTH);
       std::memcpy(payload->keys[i].data(), key.data(),
-                  std::min<size_t>(KEY_LENGTH, key.size()));
+                  std::min<size_t>(KEY_LENGTH - 1, key.size()));
     }
 
     auto packet = ConstructPacket(std::move(payload), controller_ip_in_,
@@ -583,10 +635,8 @@ void ServerInstance::SendMigrationReady() {
 
 void ServerInstance::HandleMigrationStart(uint32_t request_id) {
   if (SendAsk(request_id, controller_ip_in_))
-    if (!fsm_.transitionTo(MigrationStateMachine::State::START)) {
+    if (!fsm_.transitionTo(MigrationStateMachine::State::TRANSFERRING))
       perror("Set START error");
-      return;
-    }
 }
 
 std::unordered_map<std::string, std::vector<ServerInstance::KVPair>>
@@ -617,9 +667,9 @@ ServerInstance::HashKeysToIps(const std::vector<KVPair> &kv_pairs,
 }
 
 void ServerInstance::StartMigration() {
-  auto meta = fsm_.getMigrationMeta();
+  auto meta = fsm_.getSourceMigrationMeta();
   const auto &keys = *meta->keys;
-  const ClusterInfo &dst_cluster = (*clusters_info_)[meta->dest_rack];
+  const ClusterInfo &dst_cluster = (*clusters_info_)[meta->dst_rack];
 
   std::vector<std::optional<std::string>> values;
   redis_->mget(keys.begin(), keys.end(), std::back_inserter(values));
@@ -632,28 +682,31 @@ void ServerInstance::StartMigration() {
   }
 
   size_t total_keys = kv_pairs.size();
-  size_t total_batches = (total_keys + BATCH_SIZE - 1) / BATCH_SIZE;
+  size_t total_chunks = (total_keys + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
   auto keys_to_ip = HashKeysToIps(kv_pairs, dst_cluster.servers_ip);
 
   for (const auto &it : keys_to_ip) {
-    for (size_t batch_index = 0; batch_index < total_batches; ++batch_index) {
-      size_t start = batch_index * BATCH_SIZE;
-      size_t end = std::min(start + BATCH_SIZE, total_keys);
+    for (size_t chunk_index = 0; chunk_index < total_chunks; ++chunk_index) {
+      size_t start = chunk_index * CHUNK_SIZE;
+      size_t end = std::min(start + CHUNK_SIZE, total_keys);
 
       auto payload = std::make_unique<KV_Migration>();
+      payload->request_id = generate_request_id();
       payload->dev_id = static_cast<uint8_t>(rack_id_);
-      payload->migration_id = static_cast<uint8_t>(meta->id);
+      payload->migration_id = htonl(meta->id);
       payload->src_rack_id = static_cast<uint8_t>(rack_id_);
-      payload->dst_rack_id = static_cast<uint8_t>(meta->dest_rack);
-      payload->current_offset = htons(start);
+      payload->dst_rack_id = meta->dst_rack;
+      payload->chunk_index = htons(chunk_index);
+      payload->total_chunks = htons(total_chunks);
+      payload->chunk_size = htons(end - start);
       payload->compression = 1;
-      payload->is_last_chunk = (batch_index == total_batches - 1) ? 1 : 0;
+      payload->is_last_chunk = (chunk_index == total_chunks - 1) ? 1 : 0;
 
-      std::vector<KVPair> batch_kv_pairs(it.second.begin() + start,
+      std::vector<KVPair> chunk_kv_pairs(it.second.begin() + start,
                                          it.second.begin() + end);
 
-      std::vector<uint8_t> raw_data = CompressKvPairs(batch_kv_pairs);
+      std::vector<uint8_t> raw_data = CompressKvPairs(chunk_kv_pairs);
       auto packet = ConstructPacket(std::move(payload),
                                     inet_addr(it.first.c_str()), server_ip_in_);
 

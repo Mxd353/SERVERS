@@ -17,7 +17,7 @@
 
 constexpr uint16_t IPV4_HDR_LEN = sizeof(struct iphdr);
 
-constexpr size_t BATCH_SIZE = 32;
+constexpr size_t CHUNK_SIZE = 32;
 
 class ServerInstance : public MigrationStateMachine::Observer {
  public:
@@ -88,6 +88,11 @@ class ServerInstance : public MigrationStateMachine::Observer {
 
   std::mutex request_map_mutex_;
   std::unordered_map<uint32_t, std::promise<bool>> request_map_;
+
+  std::shared_ptr<MigrationStateMachine::DestinationMigrationMeta>
+  EnsureMigrationMeta(uint32_t migration_id, uint8_t source_rack,
+                      uint16_t total_chunks,
+                      std::vector<std::string>&& initial_keys);
 
   template <typename PayloadType>
   std::vector<uint8_t> ConstructPacket(std::unique_ptr<PayloadType> payload,

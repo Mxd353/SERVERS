@@ -22,10 +22,18 @@ class MigrationStateMachine {
     DONE = MIGRATION_DONE                   // 两种模式共有
   };
 
-  struct MigrationMeta {
+  struct SourceMigrationMeta {
     uint32_t id = 0;
-    uint8_t rack_info = 0;  // 源模式: 目标rack; 目的模式: 源rack
+    uint8_t dst_rack = 0;
     std::shared_ptr<std::vector<std::string>> keys;
+  };
+
+  struct DestinationMigrationMeta {
+    uint32_t id = 0;
+    uint8_t src_rack = 0;
+    std::shared_ptr<std::vector<std::string>> keys;
+    std::unordered_set<uint16_t> received_chunks;
+    uint16_t total_chunks;
   };
 
   class Observer {
@@ -61,7 +69,7 @@ class MigrationStateMachine {
 
       current_source_state_ = new_state;
       if (observer_) {
-        std::shared_ptr<const MigrationMeta> meta;
+        std::shared_ptr<const SourceMigrationMeta> meta;
         {
           std::lock_guard<std::mutex> meta_lock(meta_mutex_);
           meta = source_meta_;
@@ -115,11 +123,10 @@ class MigrationStateMachine {
       return false;
     }
 
-    auto meta = std::make_shared<MigrationMeta>();
+    auto meta = std::make_shared<SourceMigrationMeta>();
     meta->id = migration_id;
-    meta->rack_info = dest_rack;
-    meta->keys =
-        std::make_shared<std::vector<std::string>>(std::move(keys));
+    meta->dst_rack = dest_rack;
+    meta->keys = std::make_shared<std::vector<std::string>>(std::move(keys));
 
     {
       std::lock_guard<std::mutex> meta_lock(meta_mutex_);
@@ -144,12 +151,10 @@ class MigrationStateMachine {
       return false;
     }
 
-    auto meta = std::make_shared<MigrationMeta>();
-    meta = std::make_shared<MigrationMeta>();
+    auto meta = std::make_shared<DestinationMigrationMeta>();
     meta->id = migration_id;
-    meta->rack_info = source_rack;
-    meta->keys =
-        std::make_shared<std::vector<std::string>>(std::move(keys));
+    meta->src_rack = source_rack;
+    meta->keys = std::make_shared<std::vector<std::string>>(std::move(keys));
 
     DestinationMeta dmeta;
     dmeta.meta = meta;
@@ -169,13 +174,13 @@ class MigrationStateMachine {
     return true;
   }
 
-  std::shared_ptr<const MigrationMeta> getSourceMigrationMeta() const {
+  std::shared_ptr<const SourceMigrationMeta> getSourceMigrationMeta() const {
     std::lock_guard<std::mutex> lock(meta_mutex_);
     return source_meta_;
   }
 
-  std::shared_ptr<const MigrationMeta> getDestinationMigrationMeta(
-      uint32_t migration_id) const {
+  std::shared_ptr<DestinationMigrationMeta> getDestinationMigrationMeta(
+      uint32_t migration_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = destination_metas_.find(migration_id);
     return (it != destination_metas_.end()) ? it->second.meta : nullptr;
@@ -235,7 +240,7 @@ class MigrationStateMachine {
   };
 
   struct DestinationMeta {
-    std::shared_ptr<const MigrationMeta> meta;
+    std::shared_ptr<DestinationMigrationMeta> meta;
     State state = State::NO;
   };
 
@@ -295,5 +300,5 @@ class MigrationStateMachine {
   Observer* observer_ = nullptr;
 
   mutable std::mutex meta_mutex_;
-  std::shared_ptr<MigrationMeta> source_meta_;
+  std::shared_ptr<SourceMigrationMeta> source_meta_;
 };
