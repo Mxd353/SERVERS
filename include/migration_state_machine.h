@@ -90,7 +90,7 @@ class MigrationStateMachine {
         return false;
       }
 
-      State old_state = it->second.state;
+      // State old_state = it->second.state;
       it->second.state = new_state;
       if (observer_) {
         auto meta = it->second.meta;

@@ -11,7 +11,6 @@
 #include <zlib.h>
 
 #include <chrono>
-#include <iostream>
 #include <optional>
 #include <thread>
 

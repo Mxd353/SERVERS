@@ -8,14 +8,13 @@
 
 #include <atomic>
 #include <boost/asio.hpp>
+#include <iostream>
 #include <memory>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 
 #include "migration_state_machine.h"
-
-constexpr uint16_t IPV4_HDR_LEN = sizeof(struct iphdr);
 
 constexpr size_t CHUNK_SIZE = 32;
 
@@ -101,6 +100,9 @@ class ServerInstance : public MigrationStateMachine::Observer {
   void ReceiveThread();
   void ProcessPacket(const std::vector<uint8_t>& packet);
   void HandleHotReply(const std::vector<uint8_t>& packet);
+  void onModeChange(MigrationStateMachine::Mode new_mode) override {
+    std::cout << "Mode changed to: " << static_cast<int>(new_mode) << "\n";
+  }
   void onStateChange(MigrationStateMachine::State new_state,
                      uint32_t migration_id) override;
   void HandleMigrationInfo(const std::vector<uint8_t>& packet);
