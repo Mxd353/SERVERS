@@ -108,7 +108,6 @@ class ServerInstance : public MigrationStateMachine::Observer {
   void HandleMigrationInfo(const std::vector<uint8_t>& packet);
   void HandleMigrationReady(const std::vector<uint8_t>& packet);
   void SendMigrationReady();
-  void HandleMigrationStart(uint32_t request_id);
   std::unordered_map<std::string, std::vector<KVPair>> HashKeysToIps(
       const std::vector<KVPair>& kv_pairs,
       const std::vector<std::string>& ip_list);

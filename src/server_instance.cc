@@ -632,12 +632,6 @@ void ServerInstance::SendMigrationReady() {
   }
 }
 
-void ServerInstance::HandleMigrationStart(uint32_t request_id) {
-  if (SendAsk(request_id, controller_ip_in_))
-    if (!fsm_.transitionTo(MigrationStateMachine::State::TRANSFERRING))
-      perror("Set START error");
-}
-
 std::unordered_map<std::string, std::vector<ServerInstance::KVPair>>
 ServerInstance::HashKeysToIps(const std::vector<KVPair> &kv_pairs,
                               const std::vector<std::string> &ip_list) {
@@ -728,8 +722,7 @@ void ServerInstance::StartMigration() {
         if (bytes_written == -1) {
           perror("Failed to write to event_fd");
         } else {
-          std::cout << "Written " << bytes_written << " bytes to event_fd"
-                    << std::endl;
+          std::cout << "Written " << bytes_written << " bytes to event_fd\n";
         }
       } else {
         std::cerr << "Event fd is no longer valid!" << std::endl;
