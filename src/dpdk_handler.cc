@@ -264,6 +264,7 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
 
   struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
   rte_prefetch0(ip_hdr);
+
   if (ip_hdr->next_proto_id == IP_PROTOCOLS_NETCACHE) {
     SwapMac(eth_hdr);
 
@@ -272,43 +273,39 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
       rte_prefetch0(kv_header);
 
       kv_header->combined |= 0x1000;
-
+      uint8_t is_req = GET_IS_REQ(kv_header->combined);
       uint8_t op = GET_OP(kv_header->combined);
 
-      // auto value_ptr = kv_header->value1.data();
-      // rte_prefetch0(value_ptr);
-
+      auto value_ptr = kv_header->value1.data();
       std::string_view key{kv_header->key.data(), KEY_LENGTH};
-      // rte_prefetch0(key.data());
 
       if (op == WRITE_REQUEST) {
-        db->set(key, std::string_view(kv_header->value1.data(), VALUE_LENGTH * 4));
-        if (auto server = GetServerByIp(ip_hdr->dst_addr)) {
-          if (server->GetKVMigrationIn()) {
+        db->set(key, std::string_view(value_ptr, VALUE_LENGTH * 4));
+        if (is_req == WRITE_MIGRATION) {
+          if (auto server = GetServerByIp(ip_hdr->dst_addr))
             server->PerWrite(key);
-          }
         }
       } else if (op == READ_REQUEST) {
-        // sw::redis::OptionalString val = db->get(key);
-        // if (auto val = db->get(key)) {
-          // memcpy(kv_header->value1.data(), val->data(), VALUE_LENGTH * 4);
+        if (auto val = db->get(key)) {
+          memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
 
-        //   if (GET_HOT_QUERY(kv_header->combined) == 1) {
-        //     struct rte_mbuf *copy =
-        //         rte_pktmbuf_copy(mbuf, mbuf->pool, 0, custom_packet_len);
-        //     if (rte_ring_enqueue(hot_report_ring, copy) != 0) {
-        //       rte_pktmbuf_free(copy);
-        //     } else {
-        //       uint64_t val = 1;
-        //       write(hot_report_event_fd_, &val, sizeof(val));
-        //     }
-        //   }
-        // } else {
-        //   RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
-        //           DECODE_IP(ip_hdr->dst_addr), KEY_LENGTH,
-        //           kv_header->key.data());
-        // }
+          if (GET_HOT_QUERY(kv_header->combined) == 1) {
+            struct rte_mbuf *copy =
+                rte_pktmbuf_copy(mbuf, mbuf->pool, 0, custom_packet_len);
+            if (rte_ring_enqueue(hot_report_ring, copy) != 0) {
+              rte_pktmbuf_free(copy);
+            } else {
+              uint64_t val = 1;
+              write(hot_report_event_fd_, &val, sizeof(val));
+            }
+          }
+        } else {
+          RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
+                  DECODE_IP(ip_hdr->dst_addr), KEY_LENGTH,
+                  kv_header->key.data());
+        }
       }
+
     } else {
       RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n",
               DECODE_IP(ip_hdr->dst_addr), rte_lcore_id());
@@ -319,6 +316,7 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
     if (nb_tx < 1) {
       rte_pktmbuf_free(mbuf);
     }
+
   } else if (ip_hdr->next_proto_id == IP_PROTOCOLS_KV_MIGRATION) {
     struct rte_mbuf *copy =
         rte_pktmbuf_copy(mbuf, mbuf->pool, 0, rte_pktmbuf_pkt_len(mbuf));

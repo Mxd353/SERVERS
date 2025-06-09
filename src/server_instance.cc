@@ -266,21 +266,26 @@ void ServerInstance::HandleKVMigration(struct KV_Migration *kv_migration_hdr,
 
 void ServerInstance::PerWrite(const std::string_view &key) {
   bool find = false;
+  uint32_t migration_id;
   std::string pre_key = std::string(key);
-  uint8_t id = kv_migration_in_id_.load();
-  {
-    std::unique_lock lock(kv_cache_mutex_);
-    auto it = kv_migration_in_cache_.find(pre_key);
-    if (it != kv_migration_in_cache_.end()) {
-      kv_migration_in_cache_.erase(pre_key);
+
+  auto ids = fsm_.getActiveDestinationMigrations();
+
+  for(uint32_t id : ids) {
+    auto meta = fsm_.getDestinationMigrationMeta(id);
+    if (meta && meta->keys && std::find(meta->keys->begin(), meta->keys->end(),
+                                        pre_key) != meta->keys->end()) {
       find = true;
+      migration_id = id;
+      break;
     }
   }
+
   if (find) {
     for (uint16_t attempt = 0; attempt < RETRIES; ++attempt) {
       auto payload = std::make_unique<PreWrite>();
       payload->request_id = generate_request_id();
-      payload->migration_id = id;
+      payload->migration_id = migration_id;
       std::memset(payload->key.data(), 0, KEY_LENGTH);
       std::memcpy(payload->key.data(), key.data(), KEY_LENGTH);
 
