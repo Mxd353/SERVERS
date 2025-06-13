@@ -1,5 +1,4 @@
 {
-    "cmake.cmakePath": "/home/mxd/tools/cmake/bin/cmake",
     "files.associations": {
         "*.cpp": "cpp",
         "*.md": "markdown",
