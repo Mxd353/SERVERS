@@ -11,8 +11,9 @@
 #define RING_SIZE 1024
 #define RTE_LOGTYPE_RING RTE_LOGTYPE_USER1
 #define RTE_LOGTYPE_DB RTE_LOGTYPE_USER2
+#define RTE_LOGTYPE_WORKER RTE_LOGTYPE_USER3
 #define NUM_MBUFS 8191
-#define MBUF_CACHE_SIZE 250
+#define MBUF_CACHE_SIZE 512
 #define BURST_SIZE 32
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
@@ -37,6 +38,7 @@ class DPDKHandler {
  private:
   volatile bool initialized_ = false;
   struct rte_mempool* mbuf_pool_;
+  // std::unordered_map<int, rte_mempool*> mbuf_pools_;
   int ret_;
   int port_id_ = -1;
   struct rte_ether_addr s_eth_addr_;
@@ -64,7 +66,7 @@ class DPDKHandler {
   static inline void SwapIpv4(struct rte_ipv4_hdr* ip_hdr);
   void MainLoop(CoreInfo core_info);
   void SpecialLoop(CoreInfo core_info);
-  int PortInit(uint16_t port, struct rte_mempool* mbuf_pool);
+  int PortInit();
   inline void BuildIptoServerMap(
       const std::vector<std::shared_ptr<ServerInstance>>& servers);
 

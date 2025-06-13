@@ -17,7 +17,19 @@ struct CustomPacket {
   KVHeader kv_header;
 };
 
+void ReverseRTE_IPV4(uint32_t ip, std::string &result) {
+  uint8_t a = (ip >> 24) & 0xFF;
+  uint8_t b = (ip >> 16) & 0xFF;
+  uint8_t c = (ip >> 8) & 0xFF;
+  uint8_t d = ip & 0xFF;
+
+  result = std::to_string(d) + "." + std::to_string(c) + "." +
+           std::to_string(b) + "." + std::to_string(a);
+}
+
 const uint32_t custom_packet_len = sizeof(CustomPacket);
+
+std::ofstream outfile("server.output");
 
 DPDKHandler::DPDKHandler() {}
 
@@ -25,11 +37,9 @@ DPDKHandler::~DPDKHandler() {
   if (initialized_) {
     initialized_ = false;
 
-    uint16_t port;
-    RTE_ETH_FOREACH_DEV(port) {
-      rte_eth_dev_stop(port);
-      rte_eth_dev_close(port);
-    }
+    uint16_t port = 0;
+    rte_eth_dev_stop(port);
+    rte_eth_dev_close(port);
 
     rte_ring_free(hot_report_ring);
     rte_ring_free(kv_migration_ring);
@@ -175,13 +185,16 @@ inline void DPDKHandler::SwapIpv4(struct rte_ipv4_hdr *ip_hdr) {
   ip_hdr->dst_addr = tmp_ip;
 }
 
-int DPDKHandler::PortInit(uint16_t port, struct rte_mempool *mbuf_pool) {
+int DPDKHandler::PortInit() {
+  uint16_t port = 0;
   uint16_t nb_rxd = RX_RING_SIZE;
   uint16_t nb_txd = TX_RING_SIZE;
   int retval;
 
-  if (mbuf_pool == NULL) {
-    printf("mbuf_pool is NULL!\n");
+  if (mbuf_pool_ == NULL) {
+    RTE_LOG(ERR, EAL,
+            "mbuf_pool is NULL, please create a mempool before calling "
+            "PortInit.\n");
     return -1;
   }
 
@@ -192,13 +205,17 @@ int DPDKHandler::PortInit(uint16_t port, struct rte_mempool *mbuf_pool) {
   struct rte_eth_dev_info dev_info;
   retval = rte_eth_dev_info_get(port, &dev_info);
   if (retval != 0) {
-    printf("Error during getting device (port %u) info: %s\n", port,
-           strerror(-retval));
+    RTE_LOG(ERR, EAL, "Error during getting device (port %u) info: %s\n", port,
+            strerror(-retval));
     return retval;
   }
 
-  printf("Max Rx Queues: %u\n", dev_info.max_rx_queues);
-  printf("Max Tx Queues: %u\n", dev_info.max_tx_queues);
+  if (dev_info.flow_type_rss_offloads & RTE_ETH_RSS_IP) {
+    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+    port_conf.rx_adv_conf.rss_conf.rss_key = nullptr;
+    port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_IP;
+    RTE_LOG(NOTICE, EAL, "RSS enabled: RTE_ETH_RSS_IP\n");
+  }
 
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
@@ -207,7 +224,7 @@ int DPDKHandler::PortInit(uint16_t port, struct rte_mempool *mbuf_pool) {
   uint16_t nb_normal_cores = normal_cores_.size();
   uint16_t nb_special_cores = special_cores_.size();
   uint16_t nb_cores = nb_normal_cores + nb_special_cores;
-  retval = rte_eth_dev_configure(port, nb_cores, nb_cores, &port_conf);
+  retval = rte_eth_dev_configure(port, nb_normal_cores, nb_cores, &port_conf);
   if (retval != 0) return retval;
 
   retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
@@ -220,7 +237,7 @@ int DPDKHandler::PortInit(uint16_t port, struct rte_mempool *mbuf_pool) {
   uint16_t queue_id = 0;
   for (uint i = 0; i < nb_normal_cores; i++) {
     retval = rte_eth_rx_queue_setup(
-        port, queue_id, nb_rxd, rte_eth_dev_socket_id(port), NULL, mbuf_pool);
+        port, queue_id, nb_rxd, rte_eth_dev_socket_id(port), NULL, mbuf_pool_);
     if (retval < 0) return retval;
 
     retval = rte_eth_tx_queue_setup(port, queue_id, nb_txd,
@@ -230,10 +247,6 @@ int DPDKHandler::PortInit(uint16_t port, struct rte_mempool *mbuf_pool) {
   }
 
   for (uint i = 0; i < nb_special_cores; i++) {
-    retval = rte_eth_rx_queue_setup(
-        port, queue_id, nb_rxd, rte_eth_dev_socket_id(port), NULL, mbuf_pool);
-    if (retval < 0) return retval;
-
     retval = rte_eth_tx_queue_setup(port, queue_id, nb_txd,
                                     rte_eth_dev_socket_id(port), &txconf);
     if (retval < 0) return retval;
@@ -244,8 +257,8 @@ int DPDKHandler::PortInit(uint16_t port, struct rte_mempool *mbuf_pool) {
   retval = rte_eth_dev_start(port);
   if (retval < 0) return retval;
 
-  printf("Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n", (unsigned)port,
-         RTE_ETHER_ADDR_BYTES(&s_eth_addr_));
+  RTE_LOG(INFO, EAL, "Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n",
+          (unsigned)port, RTE_ETHER_ADDR_BYTES(&s_eth_addr_));
 
   retval = rte_eth_promiscuous_enable(port);
   if (retval != 0) return retval;
@@ -261,9 +274,12 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
     rte_pktmbuf_free(mbuf);
     return;
   }
+  // RTE_LOG(NOTICE, CORE, "[Received] Core: %u | port: %u| queue: %hu\n",
+  //         rte_lcore_id(), port, queue_id);
 
   struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
   rte_prefetch0(ip_hdr);
+
   if (ip_hdr->next_proto_id == IP_PROTOCOLS_NETCACHE) {
     SwapMac(eth_hdr);
 
@@ -275,39 +291,40 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
 
       uint8_t op = GET_OP(kv_header->combined);
 
-      // auto value_ptr = kv_header->value1.data();
-      // rte_prefetch0(value_ptr);
-
+      auto value_ptr = kv_header->value1.data();
       std::string_view key{kv_header->key.data(), KEY_LENGTH};
-      // rte_prefetch0(key.data());
 
       if (op == WRITE_REQUEST) {
-        db->set(key, std::string_view(kv_header->value1.data(), VALUE_LENGTH * 4));
-        if (auto server = GetServerByIp(ip_hdr->dst_addr)) {
-          if (server->GetKVMigrationIn()) {
-            server->PerWrite(key);
-          }
-        }
-      } else if (op == READ_REQUEST) {
-        // sw::redis::OptionalString val = db->get(key);
-        // if (auto val = db->get(key)) {
-          // memcpy(kv_header->value1.data(), val->data(), VALUE_LENGTH * 4);
-
-        //   if (GET_HOT_QUERY(kv_header->combined) == 1) {
-        //     struct rte_mbuf *copy =
-        //         rte_pktmbuf_copy(mbuf, mbuf->pool, 0, custom_packet_len);
-        //     if (rte_ring_enqueue(hot_report_ring, copy) != 0) {
-        //       rte_pktmbuf_free(copy);
-        //     } else {
-        //       uint64_t val = 1;
-        //       write(hot_report_event_fd_, &val, sizeof(val));
-        //     }
-        //   }
-        // } else {
-        //   RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
-        //           DECODE_IP(ip_hdr->dst_addr), KEY_LENGTH,
-        //           kv_header->key.data());
+        db->set(key, std::string_view(value_ptr, VALUE_LENGTH * 4));
+        // if (GET_IS_REQ(kv_header->combined) == WRITE_MIGRATION) {
+        //   if (auto server = GetServerByIp(ip_hdr->dst_addr))
+        //     server->PerWrite(key);
         // }
+      } else if (op == READ_REQUEST) {
+        if (auto val = db->get(key)) {
+          memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
+
+          if (GET_HOT_QUERY(kv_header->combined) == 1) {
+            std::string ipStr;
+            ReverseRTE_IPV4(ip_hdr->dst_addr, ipStr);
+            if (outfile.is_open()) {
+              outfile << "[HOT] " << ipStr << " | " << key << " [ " << *val
+                      << " ]\n";
+            }
+            // struct rte_mbuf *copy =
+            //     rte_pktmbuf_copy(mbuf, mbuf->pool, 0, custom_packet_len);
+            // if (rte_ring_enqueue(hot_report_ring, copy) != 0) {
+            //   rte_pktmbuf_free(copy);
+            // } else {
+            //   uint64_t val = 1;
+            //   write(hot_report_event_fd_, &val, sizeof(val));
+            // }
+          }
+        } else {
+          RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
+                  DECODE_IP(ip_hdr->dst_addr), KEY_LENGTH,
+                  kv_header->key.data());
+        }
       }
     } else {
       RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n",
@@ -319,6 +336,7 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
     if (nb_tx < 1) {
       rte_pktmbuf_free(mbuf);
     }
+
   } else if (ip_hdr->next_proto_id == IP_PROTOCOLS_KV_MIGRATION) {
     struct rte_mbuf *copy =
         rte_pktmbuf_copy(mbuf, mbuf->pool, 0, rte_pktmbuf_pkt_len(mbuf));
@@ -332,17 +350,17 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
 }
 
 void DPDKHandler::MainLoop(CoreInfo core_info) {
-  uint16_t port;
+  uint16_t port = 0;
 
   u_int lcore_id = core_info.first;
   uint16_t queue_id = core_info.second;
 
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
     printf("Invalid lcore_id=%u\n", lcore_id);
+    rte_exit(EXIT_FAILURE, "Invalid lcore_id=%u\n", lcore_id);
     return;
   }
   if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
-    RTE_ETH_FOREACH_DEV(port)
     if (rte_eth_dev_socket_id(port) >= 0 &&
         rte_eth_dev_socket_id(port) != (int)rte_socket_id())
       printf(
@@ -351,20 +369,19 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
           "not be optimal.\n",
           port);
 
-    printf("\nCore %u Wait packets...\n", lcore_id);
+    RTE_LOG(NOTICE, WORKER,
+            "[Normal] Core: %u polling queue: %hu on socket %u\n", lcore_id,
+            queue_id, rte_lcore_to_socket_id(lcore_id));
     struct rte_mbuf *bufs[BURST_SIZE];
     while (true) {
-      RTE_ETH_FOREACH_DEV(port) {
-        const uint16_t nb_rx =
-            rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
+      const uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
 
-        if (unlikely(nb_rx == 0)) continue;
+      if (unlikely(nb_rx == 0)) continue;
 
-        if (nb_rx > 0) {
-          for (uint16_t i = 0; i < nb_rx; i++) {
-            if (bufs[i] != NULL) {
-              ProcessReceivedPacket(bufs[i], port, queue_id);
-            }
+      if (nb_rx > 0) {
+        for (uint16_t i = 0; i < nb_rx; i++) {
+          if (bufs[i] != NULL) {
+            ProcessReceivedPacket(bufs[i], port, queue_id);
           }
         }
       }
@@ -378,7 +395,8 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
   u_int lcore_id = core_info.first;
   uint16_t queue_id = core_info.second;
 
-  printf("\nCore %u For special event...\n", lcore_id);
+  RTE_LOG(NOTICE, WORKER, "[Special] Core: %u polling queue: %hu\n", lcore_id,
+          queue_id);
 
   const int timeout_ms = -1;
   epoll_event events[2];
@@ -436,7 +454,9 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
 
             int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
             if (ret < 0) {
-              std::cerr << "Failed to send packet" << std::endl;
+              RTE_LOG(ERR, WORKER,
+                      "Failed to send packet on core %u, queue %hu: %s\n",
+                      lcore_id, queue_id, rte_strerror(-ret));
               rte_pktmbuf_free(mbuf);
               return;
             }
@@ -494,7 +514,7 @@ inline void DPDKHandler::LaunchThreads(
     int ret = rte_eal_remote_launch(LaunchSpeciaLcore, core_args_.back().get(),
                                     core_id);
     if (ret < 0) {
-      std::cerr << "Failed to launch RX thread on core " << core_id
+      std::cerr << "Failed to launch special thread on core " << core_id
                 << ", error: " << rte_strerror(-ret) << std::endl;
       return;
     }
@@ -512,7 +532,7 @@ inline void DPDKHandler::LaunchThreads(
     int ret = rte_eal_remote_launch(LaunchNormalLcore, core_args_.back().get(),
                                     core_id);
     if (ret < 0) {
-      std::cerr << "Failed to launch RX thread on core " << core_id
+      std::cerr << "Failed to launch normal thread on core " << core_id
                 << ", error: " << rte_strerror(-ret) << std::endl;
       return;
     }
@@ -520,7 +540,7 @@ inline void DPDKHandler::LaunchThreads(
 }
 
 void DPDKHandler::Start() {
-  uint16_t port;
+  uint16_t port = 0;
   u_int nb_ports = rte_eth_dev_count_avail();
 
   mbuf_pool_ = rte_pktmbuf_pool_create(
@@ -541,10 +561,8 @@ void DPDKHandler::Start() {
 
   rte_ether_unformat_addr("aa:bb:cc:dd:ee:ff", &s_eth_addr_);
 
-  RTE_ETH_FOREACH_DEV(port) {
-    if (PortInit(port, mbuf_pool_) != 0)
-      rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
-  }
+  if (PortInit() != 0)
+    rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
 
   LaunchThreads(special_cores_, normal_cores_);
 
