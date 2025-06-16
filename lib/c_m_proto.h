@@ -7,8 +7,8 @@
 #include <cstdint>
 #include <vector>
 
-#define ENCODE_COMBINED(dev_id, op)                                     \
-  (((dev_id & 0xFF) << 8) | ((0x00 & 0x0F) << 4) | ((op & 0x03) << 2) | \
+#define ENCODE_COMBINED(dev_id, is_req, op)                               \
+  (((dev_id & 0xFF) << 8) | ((is_req & 0x0F) << 4) | ((op & 0x03) << 2) | \
    (0x00 & 0x03))
 #define DECODE_IP(ip) \
   ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF
@@ -19,15 +19,14 @@
 #define GET_HOT_QUERY(combined) static_cast<uint8_t>(((combined) >> 8) & 0x03)
 
 #define IP_PROTOCOLS_NETCACHE 0x54
-#define IP_PROTOCOLS_HOTREPORT 0x55
 #define IP_PROTOCOLS_MIGRATION_INFO 0x57
-#define IP_PROTOCOLS_MIGRATION_READY 0x58
-#define IP_PROTOCOLS_KV_MIGRATION 0x59
-#define IP_PROTOCOLS_PRE_WRITE 0x60
+#define IP_PROTOCOLS_CACHE_MIGRATE 0x60
 #define IP_PROTOCOLS_ASK 0x61
 
 #define KEY_LENGTH 16
 #define VALUE_LENGTH 4
+
+constexpr size_t CACHE_SIZE = 1024;
 
 constexpr uint16_t RETRIES = 3;
 
@@ -40,14 +39,14 @@ constexpr uint8_t CLIENT_REQUEST = 0;
 constexpr uint8_t SERVER_REPLY = 1;
 constexpr uint8_t CACHE_REJECT = 2;
 constexpr uint8_t CACHE_REPLY = 3;
-constexpr uint8_t WRITE_MIGRATION = 5;
+constexpr uint8_t CACHE_MIGRATE = 4;
+constexpr uint8_t WRITE_MIRROR = 5;
 
 // migration_status
 constexpr uint8_t MIGRATION_NO = 0;
-constexpr uint8_t MIGRATION_PREPARING = 3;
-constexpr uint8_t MIGRATION_TRANSFERRING = 1;
+constexpr uint8_t MIGRATION_START = 1;
 constexpr uint8_t MIGRATION_DONE = 2;
-constexpr uint8_t MIGRATION_NOT_ENOUGH = 5;
+constexpr uint8_t MIGRATION_TRANSFER_DONE = 6;
 
 #pragma pack(push, 1)
 struct BaseHeader {
@@ -57,7 +56,7 @@ struct BaseHeader {
 struct KVHeader : public BaseHeader {
   uint16_t
       combined;  // dev_id(8 bit) | is_req(4 bit) | op(2 bit) | hot_query(2 bit)
-  uint32_t count;
+  uint32_t count = 0;
   std::array<char, KEY_LENGTH> key{};
   std::array<char, VALUE_LENGTH> value1{};
   std::array<char, VALUE_LENGTH> value2{};
@@ -65,15 +64,14 @@ struct KVHeader : public BaseHeader {
   std::array<char, VALUE_LENGTH> value4{};
 };
 
-struct ReportHotKey : public BaseHeader {
-  uint8_t dev_id = 0;
-  std::array<char, KEY_LENGTH> key_hot{};
-  std::array<char, VALUE_LENGTH> value1{};
-  std::array<char, VALUE_LENGTH> value2{};
-  std::array<char, VALUE_LENGTH> value3{};
-  std::array<char, VALUE_LENGTH> value4{};
-  std::array<char, KEY_LENGTH> key_replace{};
-  uint32_t count = 0;
+struct KVMigrateHeader : public KVHeader {  // pick up from KVHeader
+  uint32_t migration_id = 0;
+  uint8_t src_rack_id = 0;
+  uint8_t dst_rack_id = 0;
+  uint16_t cache_index = 0;
+  uint16_t total_keys = 0;
+  uint8_t is_last_key = 0;
+  uint8_t padding = 0;  // Padding to align to 8 bytes
 };
 
 struct MigrationInfo : public BaseHeader {
@@ -83,32 +81,7 @@ struct MigrationInfo : public BaseHeader {
   uint8_t dst_rack_id = 0;
 };
 
-struct KeyMigrationReady : public BaseHeader {
-  uint32_t migration_id = 0;
-  uint8_t migration_status = 0;
-  uint16_t chunk_index = 0;
-  uint16_t total_chunks = 0;
-  uint16_t chunk_size = 0;
-  std::vector<std::array<char, KEY_LENGTH>> keys;
-  uint8_t is_final = 0;
-
-  KeyMigrationReady(size_t key_count = 0)
-      : keys(key_count, std::array<char, KEY_LENGTH>{}) {}
-};
-
-struct KV_Migration : public BaseHeader {
-  uint8_t dev_id = 0;
-  uint32_t migration_id = 0;
-  uint8_t src_rack_id = 0;
-  uint8_t dst_rack_id = 0;
-  uint16_t chunk_index = 0;
-  uint16_t total_chunks = 0;
-  uint16_t chunk_size = 0;
-  uint8_t compression = 1;
-  uint8_t is_last_chunk = 0;
-};
-
-struct PreWrite : public BaseHeader {
+struct CacheMigrateHeader : public BaseHeader {
   uint32_t migration_id = 0;
   std::array<char, KEY_LENGTH> key{};
 };
@@ -137,8 +110,8 @@ struct PacketTraits<KVHeader> {
 };
 
 template <>
-struct PacketTraits<ReportHotKey> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_HOTREPORT;
+struct PacketTraits<KVMigrateHeader> {
+  static constexpr uint8_t Protocol = IP_PROTOCOLS_NETCACHE;
 };
 
 template <>
@@ -147,18 +120,8 @@ struct PacketTraits<MigrationInfo> {
 };
 
 template <>
-struct PacketTraits<KeyMigrationReady> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_MIGRATION_READY;
-};
-
-template <>
-struct PacketTraits<KV_Migration> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_KV_MIGRATION;
-};
-
-template <>
-struct PacketTraits<PreWrite> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_PRE_WRITE;
+struct PacketTraits<CacheMigrateHeader> {
+  static constexpr uint8_t Protocol = IP_PROTOCOLS_CACHE_MIGRATE;
 };
 
 template <>

@@ -37,6 +37,13 @@ DPDKHandler::~DPDKHandler() {
   if (initialized_) {
     initialized_ = false;
 
+    if (kv_migration_event_fd_ptr_ && *kv_migration_event_fd_ptr_ != -1) {
+      close(*kv_migration_event_fd_ptr_);
+    }
+    if (epoll_fd_ != -1) {
+      close(epoll_fd_);
+    }
+
     uint16_t port = 0;
     rte_eth_dev_stop(port);
     rte_eth_dev_close(port);
@@ -127,13 +134,10 @@ bool DPDKHandler::Initialize(
 }
 
 void DPDKHandler::EventInit() {
-  hot_report_event_fd_ = eventfd(0, EFD_NONBLOCK);
   kv_migration_event_fd_ptr_ = std::make_shared<int>(-1);
   *kv_migration_event_fd_ptr_ = eventfd(0, EFD_NONBLOCK);
-  kv_migration_in_event_fd_ = eventfd(0, EFD_NONBLOCK);
 
-  if (hot_report_event_fd_ == -1 || *kv_migration_event_fd_ptr_ == -1 ||
-      kv_migration_in_event_fd_ == -1) {
+  if (*kv_migration_event_fd_ptr_ == -1) {
     perror("eventfd");
     exit(EXIT_FAILURE);
   }
@@ -147,25 +151,8 @@ void DPDKHandler::EventInit() {
 
   epoll_event ev1;
   ev1.events = EPOLLIN;
-  ev1.data.fd = hot_report_event_fd_;
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, hot_report_event_fd_, &ev1) == -1) {
-    perror("epoll_ctl event_fd_");
-    exit(EXIT_FAILURE);
-  }
-
-  epoll_event ev2;
-  ev2.events = EPOLLIN;
-  ev2.data.fd = *kv_migration_event_fd_ptr_;
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, *kv_migration_event_fd_ptr_, &ev2) ==
-      -1) {
-    perror("epoll_ctl kv_migration_event_fd_");
-    exit(EXIT_FAILURE);
-  }
-
-  epoll_event ev3;
-  ev3.events = EPOLLIN;
-  ev3.data.fd = kv_migration_in_event_fd_;
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, kv_migration_in_event_fd_, &ev3) ==
+  ev1.data.fd = *kv_migration_event_fd_ptr_;
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, *kv_migration_event_fd_ptr_, &ev1) ==
       -1) {
     perror("epoll_ctl kv_migration_event_fd_");
     exit(EXIT_FAILURE);
@@ -274,77 +261,53 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
     rte_pktmbuf_free(mbuf);
     return;
   }
-  // RTE_LOG(NOTICE, CORE, "[Received] Core: %u | port: %u| queue: %hu\n",
-  //         rte_lcore_id(), port, queue_id);
 
   struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
   rte_prefetch0(ip_hdr);
 
   if (ip_hdr->next_proto_id == IP_PROTOCOLS_NETCACHE) {
     SwapMac(eth_hdr);
-
-    if (auto db = GetDbByIp(ip_hdr->dst_addr)) {
+    rte_be32_t dst_addr = ip_hdr->dst_addr;
+    if (auto db = GetDbByIp(dst_addr)) {
       struct KVHeader *kv_header = (struct KVHeader *)(ip_hdr + 1);
       rte_prefetch0(kv_header);
 
-      kv_header->combined |= 0x1000;
-
       uint8_t op = GET_OP(kv_header->combined);
+      uint8_t is_req = GET_IS_REQ(kv_header->combined);
+
+      kv_header->combined |= 0x1000;
 
       auto value_ptr = kv_header->value1.data();
       std::string_view key{kv_header->key.data(), KEY_LENGTH};
 
       if (op == WRITE_REQUEST) {
         db->set(key, std::string_view(value_ptr, VALUE_LENGTH * 4));
-        // if (GET_IS_REQ(kv_header->combined) == WRITE_MIGRATION) {
-        //   if (auto server = GetServerByIp(ip_hdr->dst_addr))
-        //     server->PerWrite(key);
-        // }
+        struct KVMigrateHeader *kv_migration_header =
+            (struct KVMigrateHeader *)(kv_header);
+        if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
+          if (auto server = GetServerByIp(dst_addr))
+            server->CacheMigrate(
+                key, rte_be_to_cpu_32(kv_migration_header->migration_id));
+        }
       } else if (op == READ_REQUEST) {
         if (auto val = db->get(key)) {
           memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
-
-          if (GET_HOT_QUERY(kv_header->combined) == 1) {
-            std::string ipStr;
-            ReverseRTE_IPV4(ip_hdr->dst_addr, ipStr);
-            if (outfile.is_open()) {
-              outfile << "[HOT] " << ipStr << " | " << key << " [ " << *val
-                      << " ]\n";
-            }
-            // struct rte_mbuf *copy =
-            //     rte_pktmbuf_copy(mbuf, mbuf->pool, 0, custom_packet_len);
-            // if (rte_ring_enqueue(hot_report_ring, copy) != 0) {
-            //   rte_pktmbuf_free(copy);
-            // } else {
-            //   uint64_t val = 1;
-            //   write(hot_report_event_fd_, &val, sizeof(val));
-            // }
-          }
         } else {
           RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
-                  DECODE_IP(ip_hdr->dst_addr), KEY_LENGTH,
-                  kv_header->key.data());
+                  DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
         }
       }
+
     } else {
       RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n",
-              DECODE_IP(ip_hdr->dst_addr), rte_lcore_id());
+              DECODE_IP(dst_addr), rte_lcore_id());
     }
+
     SwapIpv4(ip_hdr);
 
     const uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &mbuf, 1);
     if (nb_tx < 1) {
       rte_pktmbuf_free(mbuf);
-    }
-
-  } else if (ip_hdr->next_proto_id == IP_PROTOCOLS_KV_MIGRATION) {
-    struct rte_mbuf *copy =
-        rte_pktmbuf_copy(mbuf, mbuf->pool, 0, rte_pktmbuf_pkt_len(mbuf));
-    if (rte_ring_enqueue(kv_migration_in_ring, copy) != 0) {
-      rte_pktmbuf_free(copy);
-    } else {
-      uint64_t val = 1;
-      write(kv_migration_in_event_fd_, &val, sizeof(val));
     }
   }
 }
@@ -399,88 +362,44 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
           queue_id);
 
   const int timeout_ms = -1;
-  epoll_event events[2];
+  epoll_event event;
   while (true) {
-    int nfds = epoll_wait(epoll_fd_, events, 2, timeout_ms);
+    int nfds = epoll_wait(epoll_fd_, &event, 1, timeout_ms);
     if (nfds == -1) {
       if (errno == EINTR) continue;
       perror("epoll_wait");
       break;
     }
 
-    for (int i = 0; i < nfds; ++i) {
-      int fd = events[i].data.fd;
+    if (nfds == 1) {
+      if (event.data.fd != *kv_migration_event_fd_ptr_) continue;
+      uint64_t val;
+      read(*kv_migration_event_fd_ptr_, &val, sizeof(val));
 
-      if (fd == hot_report_event_fd_) {
-        uint64_t val;
-        read(hot_report_event_fd_, &val, sizeof(val));
-
-        struct rte_mbuf *msg;
-        while (rte_ring_dequeue(hot_report_ring, (void **)&msg) == 0) {
-          auto *hdr = rte_pktmbuf_mtod(msg, struct CustomPacket *);
-          std::string key{hdr->kv_header.key.data(), KEY_LENGTH};
-          std::string_view value{hdr->kv_header.value1.data(),
-                                 VALUE_LENGTH * 4};
-          if (auto server = GetServerByIp(hdr->ip_hdr.dst_addr)) {
-            server->HotReport(key, value, hdr->kv_header.count);
+      std::shared_ptr<std::vector<uint8_t>> packet_data(nullptr);
+      while (rte_ring_dequeue(kv_migration_ring, (void **)&packet_data) == 0) {
+        if (packet_data) {
+          struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
+          if (!mbuf) {
+            std::cerr << "Failed to allocate mbuf" << std::endl;
+            return;
           }
-          rte_pktmbuf_free(msg);
-        }
-      } else if (fd == *kv_migration_event_fd_ptr_) {
-        uint64_t val;
-        read(*kv_migration_event_fd_ptr_, &val, sizeof(val));
+          
+          char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
+          memcpy(mbuf_data, packet_data->data(), packet_data->size());
 
-        std::shared_ptr<std::vector<uint8_t>> packet_data(nullptr);
-        while (rte_ring_dequeue(kv_migration_ring, (void **)&packet_data) ==
-               0) {
-          if (packet_data) {
-            struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
-            if (!mbuf) {
-              std::cerr << "Failed to allocate mbuf" << std::endl;
-              return;
-            }
+          rte_pktmbuf_data_len(mbuf) = packet_data->size();
+          rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf);
 
-            if (packet_data->size() > rte_pktmbuf_data_room_size(mbuf_pool_)) {
-              std::cerr << "Packet too large: " << packet_data->size()
-                        << std::endl;
-              rte_pktmbuf_free(mbuf);
-              continue;
-            }
-            char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
-            memcpy(mbuf_data, packet_data->data(), packet_data->size());
-
-            rte_pktmbuf_data_len(mbuf) = packet_data->size();
-            rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf);
-
-            int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
-            if (ret < 0) {
-              RTE_LOG(ERR, WORKER,
-                      "Failed to send packet on core %u, queue %hu: %s\n",
-                      lcore_id, queue_id, rte_strerror(-ret));
-              rte_pktmbuf_free(mbuf);
-              return;
-            }
-            packet_data.reset();
+          int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
+          if (ret < 1) {
+            RTE_LOG(ERR, WORKER,
+                    "Failed to send packet on core %u, queue %hu: %s\n",
+                    lcore_id, queue_id, rte_strerror(-ret));
+            rte_pktmbuf_free(mbuf);
+            return;
           }
-        }
-      } else if (fd == kv_migration_in_event_fd_) {
-        uint64_t val;
-        read(kv_migration_in_event_fd_, &val, sizeof(val));
-
-        struct rte_mbuf *msg;
-        while (rte_ring_dequeue(kv_migration_in_ring, (void **)&msg) == 0) {
-          struct rte_ether_hdr *eth_hdr =
-              rte_pktmbuf_mtod(msg, struct rte_ether_hdr *);
-          struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
-          struct KV_Migration *kv_migration_hdr =
-              (struct KV_Migration *)(ip_hdr + 1);
-          uint8_t *data = (uint8_t *)(kv_migration_hdr + 1);
-          size_t data_len =
-              rte_pktmbuf_data_len(msg) - sizeof(struct rte_ether_hdr) -
-              sizeof(struct rte_ipv4_hdr) - sizeof(struct KV_Migration);
-          GetServerByIp(ip_hdr->dst_addr)
-              ->HandleKVMigration(kv_migration_hdr, data, data_len);
-          rte_pktmbuf_free(msg);
+          packet_data.reset();
         }
       }
     }

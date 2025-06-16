@@ -47,9 +47,7 @@ class DPDKHandler {
   std::vector<CoreInfo> special_cores_;
   std::vector<CoreInfo> normal_cores_;
 
-  int hot_report_event_fd_ = -1;
   std::shared_ptr<int> kv_migration_event_fd_ptr_;
-  int kv_migration_in_event_fd_ = -1;
   int epoll_fd_ = -1;
 
   struct CoreArgs {

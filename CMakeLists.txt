@@ -47,10 +47,6 @@ target_compile_definitions(${TARGET_NAME}
         RTE_LIBRTE_ETHDEV_DEBUG
 )
 
-include_directories(
-    include
-)
-
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 if(Python3_FOUND)
     message(STATUS "Found Python3")
@@ -78,6 +74,19 @@ if(Boost_FOUND)
     message(STATUS "Boost libraries: ${Boost_LIBRARIES}")
 else()
     message(FATAL_ERROR "Boost not found!")
+endif()
+
+if(EXISTS "${HOME_DIR}/lib/tbb")
+    set(TBB_ROOT "${HOME_DIR}/lib/tbb")
+    set(TBB_NO_SYSTEM_PATHS ON)
+endif()
+find_package(TBB REQUIRED)
+if(TBB_FOUND)
+    message(STATUS "TBB found: ${TBB_VERSION}")
+    message(STATUS "TBB include dir: ${TBB_INCLUDE_DIRS}")
+    message(STATUS "TBB libraries: ${TBB_LIBRARIES}")
+else()
+    message(FATAL_ERROR "TBB not found!")
 endif()
 
 find_package(OpenSSL REQUIRED)
@@ -162,6 +171,7 @@ target_include_directories(${TARGET_NAME}
         ${HIREDIS_HEADER}
         ${REDIS_PLUS_PLUS_HEADER}
         include
+        ${CMAKE_SOURCE_DIR}
 )
 
 target_link_directories(${TARGET_NAME}
@@ -172,6 +182,7 @@ target_link_directories(${TARGET_NAME}
 target_link_libraries(${TARGET_NAME}
     PUBLIC
         Boost::system
+        TBB::tbb
         Threads::Threads
         OpenSSL::Crypto
         ZLIB::ZLIB

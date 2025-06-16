@@ -14,11 +14,12 @@
 #include <string>
 #include <thread>
 
-#include "migration_state_machine.h"
+#include "lib/request_map.h"
+#include "lib/c_m_proto.h"
 
 constexpr size_t CHUNK_SIZE = 32;
 
-class ServerInstance : public MigrationStateMachine::Observer {
+class ServerInstance {
  public:
   typedef std::pair<std::string, std::string> KVPair;
 
@@ -40,15 +41,10 @@ class ServerInstance : public MigrationStateMachine::Observer {
 
   [[nodiscard]] uint32_t GetIp() const noexcept { return server_ip_in_; }
   [[nodiscard]] int GetDb() const noexcept { return db_; }
-  [[nodiscard]] bool GetKVMigrationIn() const noexcept {
-    return kv_migration_in_;
-  }
+
   void SetKvMigrationRing(struct rte_ring* ring,
                           std::shared_ptr<int> kv_migration_event_fd_ptr);
-  void HotReport(const std::string& key, std::string_view value, int count);
-  void HandleKVMigration(struct KV_Migration* kv_migration_hdr, uint8_t* data,
-                         size_t data_len);
-  void PerWrite(const std::string_view& key);
+  void CacheMigrate(const std::string_view& key, uint32_t migration_id);
 
  private:
   uint8_t src_mac_[ETH_ALEN];
@@ -64,6 +60,9 @@ class ServerInstance : public MigrationStateMachine::Observer {
 
   std::shared_ptr<const std::vector<ClusterInfo>> clusters_info_;
 
+  uint index_base_;
+  uint index_limit_;
+
   struct rte_ring* kv_migration_ring_;
   std::weak_ptr<int> kv_migration_event_fd_ptr_;
 
@@ -75,23 +74,9 @@ class ServerInstance : public MigrationStateMachine::Observer {
   std::atomic<bool> running_{false};
   std::unique_ptr<sw::redis::Redis> redis_;
 
-  MigrationStateMachine fsm_;
-  std::atomic<bool> kv_migration_in_{false};
-  std::atomic<uint8_t> kv_migration_in_id_{0};
-  std::unordered_map<std::string, std::string> kv_migration_in_cache_;
-  std::shared_mutex kv_cache_mutex_;
+  uint8_t fsm_;
 
-  std::mutex hot_keys_mutex_;
-  std::unordered_set<std::string> confirmed_hot_keys_;
-  std::unordered_set<std::string> pending_hot_keys_;
-
-  std::mutex request_map_mutex_;
-  std::unordered_map<uint32_t, std::promise<bool>> request_map_;
-
-  std::shared_ptr<MigrationStateMachine::DestinationMigrationMeta>
-  EnsureMigrationMeta(uint32_t migration_id, uint8_t source_rack,
-                      uint16_t total_chunks,
-                      std::vector<std::string>&& initial_keys);
+  RequestMap<uint32_t, std::promise<bool>> request_map_;
 
   template <typename PayloadType>
   std::vector<uint8_t> ConstructPacket(std::unique_ptr<PayloadType> payload,
@@ -99,22 +84,11 @@ class ServerInstance : public MigrationStateMachine::Observer {
   bool SendPacket(const std::vector<uint8_t>& packet);
   void ReceiveThread();
   void ProcessPacket(const std::vector<uint8_t>& packet);
-  void HandleHotReply(const std::vector<uint8_t>& packet);
-  void onModeChange(MigrationStateMachine::Mode new_mode) override {
-    std::cout << "Mode changed to: " << static_cast<int>(new_mode) << "\n";
-  }
-  void onStateChange(MigrationStateMachine::State new_state,
-                     uint32_t migration_id) override;
   void HandleMigrationInfo(const std::vector<uint8_t>& packet);
-  void HandleMigrationReady(const std::vector<uint8_t>& packet);
-  void SendMigrationReady();
-  std::unordered_map<std::string, std::vector<KVPair>> HashKeysToIps(
-      const std::vector<KVPair>& kv_pairs,
-      const std::vector<std::string>& ip_list);
-  void StartMigration();
-  std::vector<uint8_t> CompressKvPairs(const std::vector<KVPair>& kv_pairs);
-  std::vector<KVPair> DecompressKvPairs(
-      const std::vector<uint8_t>& compressed_data);
+  std::vector<std::pair<std::string, uint>> HashToIps(
+      std::vector<uint> indices, const std::vector<std::string>& ip_list);
+  void StartMigration(const std::vector<uint8_t>& packet);
+  std::vector<uint> SampleIndices(size_t sample_size);
   void HandleAsk(const std::vector<uint8_t>& packet);
   bool SendAsk(uint32_t request_id, uint32_t dst_ip, uint8_t ask = 1);
 };

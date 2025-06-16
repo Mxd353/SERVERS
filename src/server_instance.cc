@@ -62,7 +62,7 @@ ServerInstance::ServerInstance(
       controller_mac_(controller_mac),
       controller_ip_(controller_ip),
       clusters_info_(std::move(clusters_info)),
-      fsm_(this) {
+      fsm_(MIGRATION_NO) {
   sockfd_ = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
   if (sockfd_ < 0) {
     throw std::runtime_error("Failed to create raw socket");
@@ -80,6 +80,9 @@ ServerInstance::ServerInstance(
 
   server_ip_in_ = inet_addr(server_ip_.c_str());
   controller_ip_in_ = inet_addr(controller_ip_.c_str());
+
+  index_base_ = rack_id_ * CACHE_SIZE;
+  index_limit_ = index_base_ + CACHE_SIZE;
 
   struct ifreq ifr;
   memset(&ifr, 0, sizeof(ifr));
@@ -147,182 +150,52 @@ void ServerInstance::SetKvMigrationRing(
   kv_migration_event_fd_ptr_ = kv_migration_event_fd_ptr;
 }
 
-void ServerInstance::HotReport(const std::string &key, std::string_view value,
-                               int count) {
-  std::lock_guard<std::mutex> lock(hot_keys_mutex_);
-
-  if (confirmed_hot_keys_.count(key)) {
-    std::cout << "This is a confirmed hot key.\n";
-    return;
-  }
-
-  if (!pending_hot_keys_.insert(key).second) {
-    std::cout << "This is a pending hot key.\n";
-    return;
-  }
-
-  if (value.size() < VALUE_LENGTH * 4) {
-    pending_hot_keys_.erase(key);
-    throw std::runtime_error("Value too short for hot key report");
-  }
-
-  auto payload = std::make_unique<ReportHotKey>();
-  payload->request_id = generate_request_id();
-  payload->dev_id = rack_id_;
-
-  std::memset(payload->key_hot.data(), 0, KEY_LENGTH);
-  std::memcpy(payload->key_hot.data(), key.data(), KEY_LENGTH);
-  std::memcpy(payload->value1.data(), value.data(), VALUE_LENGTH * 4);
-
-  payload->count = count;
+void ServerInstance::CacheMigrate(const std::string_view &key,
+                                  uint32_t migration_id) {
+  std::string migrate_key = std::string(key);
+  auto payload = std::make_unique<struct CacheMigrateHeader>();
+  uint32_t req_id = generate_request_id();
+  payload->request_id = req_id;
+  payload->migration_id = migration_id;
+  std::memset(payload->key.data(), 0, KEY_LENGTH);
+  std::memcpy(payload->key.data(), key.data(), KEY_LENGTH);
 
   auto packet =
       ConstructPacket(std::move(payload), controller_ip_in_, server_ip_in_);
+  auto request = std::make_shared<std::promise<bool>>();
+  auto future = request->get_future();
 
-  if (SendPacket(packet)) {
-    std::cout << "[HOT] Report hot key: " << key << " to controller.\n";
-  } else {
-    std::cerr << "[HOT] Failed to send hot key report for key: " << key << "\n";
-    pending_hot_keys_.erase(key);
+  if (!request_map_.Insert(req_id, std::move(request))) {
+    std::cerr << "Duplicate request_id: " << req_id << '\n';
+    return;
   }
-}
+  RequestCleaner cleaner(request_map_, req_id);
 
-std::shared_ptr<MigrationStateMachine::DestinationMigrationMeta>
-ServerInstance::EnsureMigrationMeta(uint32_t migration_id, uint8_t source_rack,
-                                    uint16_t total_chunks,
-                                    std::vector<std::string> &&initial_keys) {
-  auto meta = fsm_.getDestinationMigrationMeta(migration_id);
-  if (meta) return meta;
-
-  const auto &active = fsm_.getActiveDestinationMigrations();
-  if (active.find(migration_id) == active.end()) {
-    fsm_.addDestinationMode(migration_id, source_rack, std::move(initial_keys));
-    meta = fsm_.getDestinationMigrationMeta(migration_id);
-    if (meta) {
-      meta->total_chunks = total_chunks;
+  for (uint16_t attempt = 0; attempt < RETRIES; ++attempt) {
+    if (!SendPacket(packet)) {
+      std::cerr << "Failed to send CacheMigrate\n";
+      continue;
     }
-  }
-  return meta;
-}
 
-void ServerInstance::HandleKVMigration(struct KV_Migration *kv_migration_hdr,
-                                       uint8_t *data, size_t data_len) {
-  uint32_t migration_id = ntohl(kv_migration_hdr->migration_id);
-  uint8_t source_rack = kv_migration_hdr->src_rack_id;
-  uint16_t chunk_index = ntohs(kv_migration_hdr->chunk_index);
-  uint16_t total_chunks = ntohs(kv_migration_hdr->total_chunks);
-
-  std::vector<uint8_t> compressed_data(data, data + data_len);
-  std::vector<KVPair> decompressed_pairs;
-  try {
-    decompressed_pairs = DecompressKvPairs(compressed_data);
-  } catch (const std::exception &e) {
-    std::cerr << "Decompression failed: " << e.what() << "\n";
-    return;
-  }
-
-  redis_->mset(decompressed_pairs.begin(), decompressed_pairs.end());
-
-  std::vector<std::string> keys_cache;
-  keys_cache.reserve(decompressed_pairs.size());
-  for (const auto &kv : decompressed_pairs) {
-    keys_cache.emplace_back(kv.first);
-  }
-
-  auto meta = EnsureMigrationMeta(migration_id, source_rack, total_chunks,
-                                  std::move(keys_cache));
-  if (!meta) {
-    std::cerr << "[Error] Failed to obtain migration meta\n";
-    return;
-  }
-
-  if (chunk_index >= meta->total_chunks) {
-    std::cerr << "[Warning] Invalid chunk index " << chunk_index << "\n";
-    return;
-  }
-  if (!meta->received_chunks.insert(chunk_index).second) {
-    std::cerr << "[Info] Duplicate chunk " << chunk_index << " for migration "
-              << migration_id << "\n";
-    return;
-  }
-
-  if (meta->keys) {
-    meta->keys->reserve(meta->keys->size() + decompressed_pairs.size());
-    for (auto &kv : decompressed_pairs)
-      meta->keys->emplace_back(std::move(kv.first));
-  }
-
-  if (kv_migration_hdr->is_last_chunk &&
-      meta->received_chunks.size() != meta->total_chunks) {
-    std::cerr << "Last chunk arrived but some chunks are still missing.\n";
-  }
-
-  if (meta->received_chunks.size() == meta->total_chunks) {
-    std::cout << "KV migration " << migration_id
-              << " completed successfully.\n";
-    fsm_.transitionTo(MigrationStateMachine::State::DONE, migration_id);
-  }
-}
-
-void ServerInstance::PerWrite(const std::string_view &key) {
-  bool find = false;
-  uint32_t migration_id;
-  std::string pre_key = std::string(key);
-
-  auto ids = fsm_.getActiveDestinationMigrations();
-
-  for (uint32_t id : ids) {
-    auto meta = fsm_.getDestinationMigrationMeta(id);
-    if (meta && meta->keys &&
-        std::find(meta->keys->begin(), meta->keys->end(), pre_key) !=
-            meta->keys->end()) {
-      find = true;
-      migration_id = id;
-      break;
-    }
-  }
-
-  if (find) {
-    for (uint16_t attempt = 0; attempt < RETRIES; ++attempt) {
-      auto payload = std::make_unique<PreWrite>();
-      payload->request_id = generate_request_id();
-      payload->migration_id = migration_id;
-      std::memset(payload->key.data(), 0, KEY_LENGTH);
-      std::memcpy(payload->key.data(), key.data(), KEY_LENGTH);
-
-      auto packet =
-          ConstructPacket(std::move(payload), controller_ip_in_, server_ip_in_);
-      std::promise<bool> result;
-      auto future = result.get_future();
-      {
-        std::lock_guard<std::mutex> lock(request_map_mutex_);
-        request_map_[payload->request_id] = std::move(result);
-      }
-
-      if (!SendPacket(packet)) {
-        std::cerr << "Failed to send PerWrite\n";
-        std::lock_guard<std::mutex> lock(request_map_mutex_);
-        request_map_.erase(payload->request_id);
-        continue;
-      }
-
-      if (future.wait_for(std::chrono::seconds(2)) ==
-          std::future_status::ready) {
-        try {
-          if (future.get()) return;
-        } catch (const std::exception &e) {
-          std::cerr << "Promise future error: " << e.what() << '\n';
+    if (future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+      try {
+        if (future.get())
+          return;
+        else {
+          std::cerr << "CacheMigrate failed for key: " << migrate_key
+                    << " on attempt " << attempt + 1 << '\n';
         }
-      } else {
-        std::cerr << "Timeout waiting for PerWrite ACK\n";
+      } catch (const std::exception &e) {
+        std::cerr << "Promise future error: " << e.what() << '\n';
+      } catch (...) {
+        std::cerr << "Unknown promise error\n";
       }
-      {
-        std::lock_guard<std::mutex> lock(request_map_mutex_);
-        request_map_.erase(payload->request_id);
-      }
-      exponentialBackoff(attempt);
+    } else {
+      std::cerr << "Timeout waiting for CacheMigrate ACK\n";
     }
+    exponentialBackoff(attempt);
   }
+  std::cerr << "Max retries exceeded";
 }
 
 template <typename PayloadType>
@@ -435,9 +308,6 @@ void ServerInstance::ProcessPacket(const std::vector<uint8_t> &packet) {
   const struct iphdr *ip_hdr =
       reinterpret_cast<const struct iphdr *>(packet.data() + ETH_HLEN);
   switch (ip_hdr->protocol) {
-    case IP_PROTOCOLS_HOTREPORT:
-      HandleHotReply(packet);
-      break;
     case IP_PROTOCOLS_MIGRATION_INFO:
       HandleMigrationInfo(packet);
       break;
@@ -445,48 +315,8 @@ void ServerInstance::ProcessPacket(const std::vector<uint8_t> &packet) {
       HandleAsk(packet);
       break;
     default:
-      break;
-  }
-}
-
-void ServerInstance::HandleHotReply(const std::vector<uint8_t> &packet) {
-  const struct ReportHotKey *hot_reply_hdr =
-      reinterpret_cast<const struct ReportHotKey *>(packet.data() + ETH_HLEN +
-                                                    IPV4_HDR_LEN);
-
-  std::string key_new(hot_reply_hdr->key_hot.data(), KEY_LENGTH);
-  std::string key_replay(hot_reply_hdr->key_replace.data(), KEY_LENGTH);
-
-  std::lock_guard<std::mutex> lock(hot_keys_mutex_);
-  if (pending_hot_keys_.erase(key_new)) {
-    confirmed_hot_keys_.insert(key_new);
-    pending_hot_keys_.erase(key_replay);
-    confirmed_hot_keys_.erase(key_replay);
-    std::cout << "[HOT] Confirmed hot key: " << key_new << " | " << key_replay
-              << "\n";
-
-  } else {
-    std::cout << "[HOT] Received confirmation for unknown key: " << key_new
-              << "\n";
-  }
-}
-
-void ServerInstance::onStateChange(MigrationStateMachine::State new_state,
-                                   uint32_t migration_id) {
-  switch (new_state) {
-    case MigrationStateMachine::State::NO:
-      std::cout << "Migration reset for ID: " << migration_id << ".\n";
-      break;
-    case MigrationStateMachine::State::PREPARING:
-      std::cout << "Migration PREPARING for ID: " << migration_id << ".\n";
-      SendMigrationReady();
-      break;
-    case MigrationStateMachine::State::TRANSFERRING:
-      std::cout << "Migration TRANSFERRING for ID: " << migration_id << ".\n";
-      StartMigration();
-      break;
-    case MigrationStateMachine::State::DONE:
-      std::cout << "Migration DONE for ID: " << migration_id << ".\n";
+      std::cerr << "[ProcessPacket] Unknown protocol: "
+                << static_cast<int>(ip_hdr->protocol) << "\n";
       break;
   }
 }
@@ -496,14 +326,10 @@ void ServerInstance::HandleMigrationInfo(const std::vector<uint8_t> &packet) {
       reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
                                                      IPV4_HDR_LEN);
   switch (migration_info_hdr->migration_status) {
-    case MIGRATION_PREPARING:
-      HandleMigrationReady(packet);
+    case MIGRATION_START:
+      StartMigration(packet);
       break;
-    case MIGRATION_TRANSFERRING:
-      if (SendAsk(migration_info_hdr->request_id, controller_ip_in_))
-        if (!fsm_.transitionTo(MigrationStateMachine::State::TRANSFERRING))
-          perror("Set TRANSFERRING error");
-      break;
+
     case MIGRATION_DONE:
 
       break;
@@ -512,212 +338,79 @@ void ServerInstance::HandleMigrationInfo(const std::vector<uint8_t> &packet) {
   }
 }
 
-void ServerInstance::HandleMigrationReady(const std::vector<uint8_t> &packet) {
-  const struct iphdr *ip_hdr =
-      reinterpret_cast<const struct iphdr *>(packet.data() + ETH_HLEN);
-  const struct MigrationInfo *migration_info_hdr =
-      reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
-                                                     IPV4_HDR_LEN);
-  uint total_keys = 0;
-  {
-    std::lock_guard<std::mutex> lock(hot_keys_mutex_);
-    total_keys = confirmed_hot_keys_.size() / 2;
-  }
-  if (total_keys == 0) {
-    for (uint16_t attempt = 0; attempt < RETRIES; ++attempt) {
-      auto payload = std::make_unique<KeyMigrationReady>();
-      payload->request_id = generate_request_id();
-      payload->migration_id = migration_info_hdr->migration_id;
-      payload->migration_status = MIGRATION_NOT_ENOUGH;
-      payload->is_final = 1;
-
-      auto packet =
-          ConstructPacket(std::move(payload), ip_hdr->saddr, ip_hdr->daddr);
-      std::promise<bool> result;
-      auto future = result.get_future();
-      {
-        std::lock_guard<std::mutex> lock(request_map_mutex_);
-        request_map_[payload->request_id] = std::move(result);
-      }
-
-      if (!SendPacket(packet)) {
-        std::cerr << "Failed to send KeyMigrationReady\n";
-        std::lock_guard<std::mutex> lock(request_map_mutex_);
-        request_map_.erase(payload->request_id);
-        continue;
-      }
-
-      if (future.wait_for(std::chrono::seconds(2)) ==
-          std::future_status::ready) {
-        try {
-          if (future.get()) return;
-        } catch (const std::exception &e) {
-          std::cerr << "Promise future error: " << e.what() << '\n';
-        }
-      } else {
-        std::cerr << "Timeout waiting for KeyMigrationReady ACK\n";
-      }
-      {
-        std::lock_guard<std::mutex> lock(request_map_mutex_);
-        request_map_.erase(payload->request_id);
-      }
-      exponentialBackoff(attempt);
-    }
-  } else {
-    std::vector<std::string> selected;
-    selected.reserve(confirmed_hot_keys_.size());
-    std::hash<std::string> hasher;
-    for (auto &key : confirmed_hot_keys_) {
-      if ((hasher(key) % 2) == 0) {
-        selected.emplace_back(std::move(key));
-      }
-    }
-
-    if (!fsm_.startSourceMode(ntohl(migration_info_hdr->migration_id),
-                              migration_info_hdr->dst_rack_id,
-                              std::move(selected))) {
-      perror("Set READY with meta error");
-    }
-  }
-}
-
-void ServerInstance::SendMigrationReady() {
-  auto meta = fsm_.getSourceMigrationMeta();
-  const auto &keys = *meta->keys;
-  size_t total_keys = keys.size();
-  size_t total_chunks = (total_keys + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-  for (size_t chunk_index = 0; chunk_index < total_chunks; ++chunk_index) {
-    size_t start = chunk_index * CHUNK_SIZE;
-    size_t end = std::min(start + CHUNK_SIZE, total_keys);
-    size_t current_chunk_size = end - start;
-
-    auto payload = std::make_unique<KeyMigrationReady>();
-    payload->request_id = generate_request_id();
-    payload->migration_id = htonl(meta->id);
-    payload->migration_status = MIGRATION_PREPARING;
-    payload->chunk_index = htons(chunk_index);
-    payload->total_chunks = htons(total_chunks);
-    payload->chunk_size = htons(current_chunk_size);
-    payload->is_final = (chunk_index == total_chunks - 1) ? 1 : 0;
-
-    for (size_t i = 0; i < current_chunk_size; ++i) {
-      const std::string &key = keys[start + i];
-      std::memset(payload->keys[i].data(), 0, KEY_LENGTH);
-      std::memcpy(payload->keys[i].data(), key.data(),
-                  std::min<size_t>(KEY_LENGTH - 1, key.size()));
-    }
-
-    auto packet = ConstructPacket(std::move(payload), controller_ip_in_,
-                                  controller_ip_in_);
-    std::promise<bool> result;
-    auto future = result.get_future();
-    {
-      std::lock_guard<std::mutex> lock(request_map_mutex_);
-      request_map_[payload->request_id] = std::move(result);
-    }
-    for (uint16_t attempt = 0; attempt < RETRIES; ++attempt) {
-      if (!SendPacket(packet)) {
-        std::cerr << "Failed to send KeyMigrationReady\n";
-        std::lock_guard<std::mutex> lock(request_map_mutex_);
-        request_map_.erase(payload->request_id);
-        break;
-      }
-      if (future.wait_for(std::chrono::seconds(2)) ==
-          std::future_status::ready) {
-        bool result = future.get();
-        if (result) break;
-      } else {
-        std::cerr << "Timeout waiting for KeyMigrationReady ACK\n";
-      }
-      exponentialBackoff(attempt);
-    }
-    {
-      std::lock_guard<std::mutex> lock(request_map_mutex_);
-      request_map_.erase(payload->request_id);
-    }
-  }
-}
-
-std::unordered_map<std::string, std::vector<ServerInstance::KVPair>>
-ServerInstance::HashKeysToIps(const std::vector<KVPair> &kv_pairs,
-                              const std::vector<std::string> &ip_list) {
-  std::unordered_map<std::string, std::vector<KVPair>> result;
+std::vector<std::pair<std::string, uint>> ServerInstance::HashToIps(
+    std::vector<uint> indices, const std::vector<std::string> &ip_list) {
+  std::hash<int> hasher;
+  std::vector<std::pair<std::string, uint>> result;
+  result.reserve(indices.size());
   if (ip_list.empty()) {
-    std::cerr << "Warning: IP 列表为空" << std::endl;
+    std::cerr << "IP list is empty, cannot hash indices.\n";
     return result;
   }
-  size_t num_ips = ip_list.size();
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-
-  for (const auto &kv : kv_pairs) {
-    // 计算 SHA256 哈希
-    SHA256(reinterpret_cast<const unsigned char *>(kv.first.data()),
-           kv.first.size(), hash);
-
-    uint64_t hash_val = 0;
-    std::memcpy(&hash_val, hash, sizeof(uint64_t));
-    hash_val = be64toh(hash_val);
-
-    const std::string &selected_ip = ip_list[hash_val % num_ips];
-    result[selected_ip].emplace_back(kv);
+  if (indices.empty()) {
+    std::cerr << "Indices list is empty, cannot hash to IPs.\n";
+    return result;
   }
-
+  for (uint index : indices) {
+    size_t hash_val = hasher(index);
+    size_t idx = hash_val % ip_list.size();
+    result.push_back({ip_list[idx], index});
+  }
   return result;
 }
 
-void ServerInstance::StartMigration() {
-  auto meta = fsm_.getSourceMigrationMeta();
-  const auto &keys = *meta->keys;
-  const ClusterInfo &dst_cluster = (*clusters_info_)[meta->dst_rack];
-
-  std::vector<std::optional<std::string>> values;
-  redis_->mget(keys.begin(), keys.end(), std::back_inserter(values));
-
-  std::vector<KVPair> kv_pairs;
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (values[i].has_value()) {
-      kv_pairs.push_back({keys[i], values[i].value()});
-    }
+void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
+  if (fsm_ != MIGRATION_NO) {
+    std::cerr << "Migration already in progress or completed.\n";
+    return;
   }
+  const struct MigrationInfo *migration_info_hdr =
+      reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
+                                                     IPV4_HDR_LEN);
 
-  size_t total_keys = kv_pairs.size();
-  size_t total_chunks = (total_keys + CHUNK_SIZE - 1) / CHUNK_SIZE;
+  const ClusterInfo &dst_cluster =
+      (*clusters_info_)[migration_info_hdr->dst_rack_id];
 
-  auto keys_to_ip = HashKeysToIps(kv_pairs, dst_cluster.servers_ip);
+  std::vector<uint> indices = SampleIndices(CACHE_SIZE / 2);
 
-  for (const auto &it : keys_to_ip) {
-    for (size_t chunk_index = 0; chunk_index < total_chunks; ++chunk_index) {
-      size_t start = chunk_index * CHUNK_SIZE;
-      size_t end = std::min(start + CHUNK_SIZE, total_keys);
+  auto index_to_ips = HashToIps(indices, dst_cluster.servers_ip);
 
-      auto payload = std::make_unique<KV_Migration>();
-      payload->request_id = generate_request_id();
-      payload->dev_id = static_cast<uint8_t>(rack_id_);
-      payload->migration_id = htonl(meta->id);
-      payload->src_rack_id = static_cast<uint8_t>(rack_id_);
-      payload->dst_rack_id = meta->dst_rack;
-      payload->chunk_index = htons(chunk_index);
-      payload->total_chunks = htons(total_chunks);
-      payload->chunk_size = htons(end - start);
-      payload->compression = 1;
-      payload->is_last_chunk = (chunk_index == total_chunks - 1) ? 1 : 0;
+  for (const auto &it : index_to_ips) {
+    uint32_t req_id = generate_request_id();
+    auto payload = std::make_unique<KVMigrateHeader>();
+    payload->request_id = req_id;
+    payload->combined = ENCODE_COMBINED(rack_id_, CACHE_MIGRATE, WRITE_REQUEST);
 
-      std::vector<KVPair> chunk_kv_pairs(it.second.begin() + start,
-                                         it.second.begin() + end);
+    payload->migration_id = migration_info_hdr->migration_id;
+    payload->src_rack_id = migration_info_hdr->src_rack_id;
+    payload->dst_rack_id = migration_info_hdr->dst_rack_id;
+    payload->cache_index = htons(it.second);
+    payload->total_keys = htons(index_to_ips.size());
+    payload->is_last_key = (it.second == index_to_ips.end()->second) ? 1 : 0;
 
-      std::vector<uint8_t> raw_data = CompressKvPairs(chunk_kv_pairs);
-      auto packet = ConstructPacket(std::move(payload),
-                                    inet_addr(it.first.c_str()), server_ip_in_);
+    auto packet = ConstructPacket(std::move(payload),
+                                  inet_addr(it.first.c_str()), server_ip_in_);
 
-      packet.insert(packet.end(), raw_data.begin(), raw_data.end());
-      auto packet_data =
-          std::make_shared<std::vector<uint8_t>>(std::move(packet));
+    auto packet_data =
+        std::make_shared<std::vector<uint8_t>>(std::move(packet));
 
+    auto request = std::make_shared<std::promise<bool>>();
+    auto future = request->get_future();
+
+    if (!request_map_.Insert(req_id, std::move(request))) {
+      std::cerr << "Duplicate request_id: " << req_id << '\n';
+      break;
+    }
+
+    RequestCleaner cleaner(request_map_, req_id);
+
+    bool success = false;
+    for (uint16_t attempt = 0; attempt < RETRIES; ++attempt) {
       int ret = rte_ring_enqueue(kv_migration_ring_, packet_data.get());
       if (ret < 0) {
         std::cerr << "Failed to enqueue migration packet to ring: " << ret
                   << std::endl;
+        continue;
       }
 
       std::shared_ptr<int> kv_migration_event_fd =
@@ -727,94 +420,62 @@ void ServerInstance::StartMigration() {
         ssize_t bytes_written =
             write(*kv_migration_event_fd, &val, sizeof(val));
         if (bytes_written == -1) {
-          perror("Failed to write to event_fd");
-        } else {
-          std::cout << "Written " << bytes_written << " bytes to event_fd\n";
+          std::cerr << "Failed to write to event_fd\n";
         }
       } else {
-        std::cerr << "Event fd is no longer valid!" << std::endl;
+        std::cerr << "Event fd is no longer valid!\n";
       }
+
+      if (future.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready) {
+        try {
+          if (future.get()) {
+            success = true;
+            break;
+          }
+        } catch (const std::exception &e) {
+          std::cerr << "Promise future error: " << e.what() << '\n';
+        } catch (...) {
+          std::cerr << "Unknown promise error\n";
+        }
+      }
+      exponentialBackoff(attempt);
     }
+    if (!success) std::cerr << "Max retries exceeded";
   }
 }
 
-std::vector<uint8_t> ServerInstance::CompressKvPairs(
-    const std::vector<KVPair> &kv_pairs) {
-  const size_t per_kv_size = KEY_LENGTH + VALUE_LENGTH * 4;
-  const size_t uncompressed_size = kv_pairs.size() * per_kv_size;
-  std::vector<uint8_t> binary_data(uncompressed_size);
+std::vector<uint> ServerInstance::SampleIndices(size_t sample_size) {
+  std::vector<uint> indices(index_base_ - index_limit_);
+  std::iota(indices.begin(), indices.end(), index_base_);
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::shuffle(indices.begin(), indices.end(), gen);
 
-  auto *dst = binary_data.data();
-  for (const auto &pair : kv_pairs) {
-    static_assert(sizeof(pair.first[0]) == 1, "Requires byte-sized elements");
-    static_assert(sizeof(pair.second[0]) == 1, "Requires byte-sized elements");
-
-    memcpy(dst, pair.first.data(), KEY_LENGTH);
-    memcpy(dst + KEY_LENGTH, pair.second.data(), VALUE_LENGTH);
-    dst += per_kv_size;
+  if (sample_size > indices.size()) {
+    sample_size = indices.size();
   }
 
-  uLongf compressed_size = compressBound(uncompressed_size);
-  std::vector<uint8_t> compressed;
-  compressed.resize(compressed_size);
-
-  int ret =
-      compress2(reinterpret_cast<Bytef *>(compressed.data()), &compressed_size,
-                binary_data.data(), uncompressed_size, Z_BEST_SPEED);
-
-  if (ret != Z_OK) {
-    throw std::runtime_error("zlib compression failed: " + std::to_string(ret));
-  }
-
-  compressed.resize(compressed_size);
-  compressed.shrink_to_fit();
-
-  return compressed;
-}
-
-std::vector<ServerInstance::KVPair> ServerInstance::DecompressKvPairs(
-    const std::vector<uint8_t> &compressed_data) {
-  uLongf decompressed_size = compressBound(compressed_data.size());
-  std::vector<uint8_t> decompressed_data(decompressed_size);
-
-  int ret = uncompress(reinterpret_cast<Bytef *>(decompressed_data.data()),
-                       &decompressed_size, compressed_data.data(),
-                       compressed_data.size());
-
-  if (ret != Z_OK) {
-    throw std::runtime_error("zlib decompression failed: " +
-                             std::to_string(ret));
-  }
-
-  decompressed_data.resize(decompressed_size);
-
-  std::vector<KVPair> kv_pairs;
-  const size_t per_kv_size = KEY_LENGTH + VALUE_LENGTH * 4;
-  size_t total_kv_pairs = decompressed_size / per_kv_size;
-
-  auto *data_ptr = decompressed_data.data();
-  for (size_t i = 0; i < total_kv_pairs; ++i) {
-    std::array<char, KEY_LENGTH> key;
-    std::array<char, VALUE_LENGTH> value;
-
-    memcpy(key.data(), data_ptr, KEY_LENGTH);
-    memcpy(value.data(), data_ptr + KEY_LENGTH, VALUE_LENGTH);
-
-    kv_pairs.push_back({std::string(key.begin(), key.end()),
-                        std::string(value.begin(), value.end())});
-    data_ptr += per_kv_size;
-  }
-
-  return kv_pairs;
+  return std::vector<uint>(indices.begin(), indices.begin() + sample_size);
 }
 
 void ServerInstance::HandleAsk(const std::vector<uint8_t> &packet) {
   const struct AskPacket *ask =
       reinterpret_cast<const struct AskPacket *>(packet.data() + IPV4_HDR_LEN);
-  auto it = request_map_.find(ask->request_id);
-  if (it != request_map_.end()) {
-    it->second.set_value(true);
-    request_map_.erase(it);
+  uint32_t request_id = ask->request_id;
+  bool exist = request_map_.Modify(request_id, [&](auto &req) {
+    try {
+      if (ask->ask == 1) {
+        req->set_value(true);
+      } else {
+        req->set_value(false);
+      }
+    } catch (const std::future_error &e) {
+      std::cerr << "[Ask] Future error: " << e.what() << std::endl;
+    }
+  });
+  if (!exist) {
+    std::cerr << "[Ask] Request not exist id: " << request_id << std::endl;
   }
 }
 
