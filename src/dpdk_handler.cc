@@ -48,7 +48,6 @@ DPDKHandler::~DPDKHandler() {
     rte_eth_dev_stop(port);
     rte_eth_dev_close(port);
 
-    rte_ring_free(hot_report_ring);
     rte_ring_free(kv_migration_ring);
 
     rte_eal_cleanup();
@@ -99,25 +98,11 @@ bool DPDKHandler::Initialize(
     return false;
   }
 
-  hot_report_ring =
-      rte_ring_create("hot_report_ring", RING_SIZE, rte_socket_id(),
-                      RING_F_SC_DEQ | RING_F_MP_RTS_ENQ);
-  if (hot_report_ring == nullptr) {
-    rte_exit(EXIT_FAILURE, "Cannot create hot_report_ring\n");
-  }
-
   kv_migration_ring =
       rte_ring_create("kv_migration_ring", RING_SIZE, rte_socket_id(),
                       RING_F_SC_DEQ | RING_F_MP_RTS_ENQ);
   if (kv_migration_ring == nullptr) {
     rte_exit(EXIT_FAILURE, "Cannot create kv_migration_ring\n");
-  }
-
-  kv_migration_in_ring =
-      rte_ring_create("kv_migration_in_ring", RING_SIZE, rte_socket_id(),
-                      RING_F_SC_DEQ | RING_F_MP_RTS_ENQ);
-  if (kv_migration_in_ring == nullptr) {
-    rte_exit(EXIT_FAILURE, "Cannot create kv_migration_in_ring\n");
   }
 
   EventInit();
@@ -315,7 +300,7 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
 void DPDKHandler::MainLoop(CoreInfo core_info) {
   uint16_t port = 0;
 
-  u_int lcore_id = core_info.first;
+  uint lcore_id = core_info.first;
   uint16_t queue_id = core_info.second;
 
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
@@ -355,7 +340,7 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
 }
 
 void DPDKHandler::SpecialLoop(CoreInfo core_info) {
-  u_int lcore_id = core_info.first;
+  uint lcore_id = core_info.first;
   uint16_t queue_id = core_info.second;
 
   RTE_LOG(NOTICE, WORKER, "[Special] Core: %u polling queue: %hu\n", lcore_id,
@@ -384,7 +369,7 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
             std::cerr << "Failed to allocate mbuf" << std::endl;
             return;
           }
-          
+
           char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
           memcpy(mbuf_data, packet_data->data(), packet_data->size());
 
@@ -460,15 +445,15 @@ inline void DPDKHandler::LaunchThreads(
 
 void DPDKHandler::Start() {
   uint16_t port = 0;
-  u_int nb_ports = rte_eth_dev_count_avail();
+  uint nb_ports = rte_eth_dev_count_avail();
 
   mbuf_pool_ = rte_pktmbuf_pool_create(
       "MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
       RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
   if (mbuf_pool_ == NULL) rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
 
-  u_int count = 0;
-  u_int lcore_id;
+  uint count = 0;
+  uint lcore_id;
 
   RTE_LCORE_FOREACH_WORKER(lcore_id) {
     if (count++ < 1) {

@@ -21,7 +21,7 @@
 class DPDKHandler {
   using ServerPair = std::pair<std::shared_ptr<ServerInstance>,
                                std::shared_ptr<sw::redis::Redis>>;
-  using CoreInfo = std::pair<u_int, uint16_t>;
+  using CoreInfo = std::pair<uint, uint16_t>;
 
  public:
   DPDKHandler();
@@ -31,16 +31,13 @@ class DPDKHandler {
                   const std::vector<std::shared_ptr<ServerInstance>>& servers);
   void Start();
 
-  struct rte_ring* hot_report_ring;
   struct rte_ring* kv_migration_ring;
-  struct rte_ring* kv_migration_in_ring;
 
  private:
   volatile bool initialized_ = false;
   struct rte_mempool* mbuf_pool_;
   // std::unordered_map<int, rte_mempool*> mbuf_pools_;
   int ret_;
-  int port_id_ = -1;
   struct rte_ether_addr s_eth_addr_;
   std::shared_mutex ip_map_mutex_;
   std::unordered_map<rte_be32_t, ServerPair> ip_to_server_;
