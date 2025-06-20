@@ -40,6 +40,7 @@ constexpr uint8_t SERVER_REPLY = 1;
 constexpr uint8_t CACHE_REJECT = 2;
 constexpr uint8_t CACHE_REPLY = 3;
 constexpr uint8_t CACHE_MIGRATE = 4;
+constexpr uint8_t MIGRATE_REPLY = 6;
 constexpr uint8_t WRITE_MIRROR = 5;
 
 // migration_status

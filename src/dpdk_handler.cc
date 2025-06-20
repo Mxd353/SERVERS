@@ -258,21 +258,30 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
       rte_prefetch0(kv_header);
 
       uint8_t op = GET_OP(kv_header->combined);
-      uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
-      kv_header->combined |= 0x1000;
+      uint8_t is_req = GET_IS_REQ(kv_header->combined);
+      if (is_req == CLIENT_REQUEST) kv_header->combined |= 0x1000; // SERVER_REPLY << 12
 
       auto value_ptr = kv_header->value1.data();
       std::string_view key{kv_header->key.data(), KEY_LENGTH};
 
       if (op == WRITE_REQUEST) {
         db->set(key, std::string_view(value_ptr, VALUE_LENGTH * 4));
-        struct KVMigrateHeader *kv_migration_header =
-            (struct KVMigrateHeader *)(kv_header);
+
         if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
+          RTE_LOG(INFO, DB, "Receive a %s packet\n",
+                  is_req == WRITE_MIRROR ? "WRITE_MIRROR" : "CACHE_MIGRATE");
+          struct KVMigrateHeader *kv_migration_header =
+              (struct KVMigrateHeader *)(kv_header);
           if (auto server = GetServerByIp(dst_addr))
             server->CacheMigrate(
                 key, rte_be_to_cpu_32(kv_migration_header->migration_id));
+          if (is_req == WRITE_MIRROR) {
+            rte_pktmbuf_free(mbuf);
+            return;
+          } else if (is_req == CACHE_MIGRATE) {
+            kv_header->combined |= 0x6000; // MIGRATE_REPLY << 12
+          }
         }
       } else if (op == READ_REQUEST) {
         if (auto val = db->get(key)) {
@@ -282,13 +291,13 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
                   DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
         }
       }
-
     } else {
       RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n",
               DECODE_IP(dst_addr), rte_lcore_id());
     }
 
-    SwapIpv4(ip_hdr);
+    ip_hdr->dst_addr = ip_hdr->src_addr;
+    ip_hdr->src_addr = dst_addr;
 
     const uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &mbuf, 1);
     if (nb_tx < 1) {
