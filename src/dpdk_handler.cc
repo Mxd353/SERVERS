@@ -282,12 +282,12 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
             server->HandleMigrateReply(kv_header->request_id);
         }
       } else if (op == READ_REQUEST) {
-        // if (auto val = db->get(key)) {
-        //   memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
-        // } else {
-        //   RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
-        //           DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
-        // }
+        if (auto val = db->get(key)) {
+          memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
+        } else {
+          RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
+                  DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
+        }
       }
     } else {
       RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n",
