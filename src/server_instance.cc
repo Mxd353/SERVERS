@@ -14,6 +14,8 @@
 #include <optional>
 #include <thread>
 
+#include "lib/utils.h"
+
 static inline uint32_t generate_request_id() {
   static std::atomic<uint32_t> counter{0};
   static std::random_device rd;
@@ -42,12 +44,6 @@ static inline void exponentialBackoff(int attempt) {
   if (attempt == 0) wait_ms = 0;
 
   std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-}
-
-static inline void SwapIpv4(struct iphdr *ip_hdr) {
-  uint32_t tmp_ip = ip_hdr->saddr;
-  ip_hdr->saddr = ip_hdr->daddr;
-  ip_hdr->daddr = tmp_ip;
 }
 
 ServerInstance::ServerInstance(
@@ -153,7 +149,6 @@ void ServerInstance::SetKvMigrationRing(
 void ServerInstance::CacheMigrate(const std::string_view &key,
                                   uint32_t migration_id) {
   std::string migrate_key = std::string(key);
-  std::cout << "get a key: " << migrate_key << "\n";
   auto payload = std::make_unique<struct CacheMigrateHeader>();
   uint32_t req_id = generate_request_id();
   payload->request_id = req_id;
@@ -346,6 +341,51 @@ std::vector<std::pair<std::string, uint>> ServerInstance::HashToIps(
   return result;
 }
 
+inline std::vector<uint8_t> ServerInstance::ConstructMigratePacket(
+    uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
+    uint8_t dst_rack_id, uint16_t index_size, uint8_t is_last_key) {
+  size_t payload_size = sizeof(struct KVMigrateHeader);
+  size_t total_size = ETH_HLEN + IPV4_HDR_LEN + payload_size;
+  std::vector<uint8_t> packet(total_size);
+
+  uint8_t s_mac[ETH_ALEN];
+  uint8_t d_mac[ETH_ALEN];
+  rte_eth_random_addr(s_mac);
+  rte_eth_random_addr(d_mac);
+  struct ethhdr *eth_hdr = reinterpret_cast<struct ethhdr *>(packet.data());
+  memcpy(eth_hdr->h_source, s_mac, ETH_ALEN);
+  memcpy(eth_hdr->h_dest, d_mac, ETH_ALEN);
+  eth_hdr->h_proto = htons(ETHERTYPE_IP);
+
+  struct iphdr *ip_hdr =
+      reinterpret_cast<struct iphdr *>(packet.data() + ETH_HLEN);
+  ip_hdr->ihl = 5;
+  ip_hdr->version = 4;
+  ip_hdr->tos = 0;
+  ip_hdr->tot_len = htons(total_size);
+  ip_hdr->id = htons(54321);
+  ip_hdr->ttl = 64;
+  ip_hdr->protocol = IP_PROTOCOLS_NETCACHE;
+  ip_hdr->saddr = src_ip;
+  ip_hdr->daddr = dst_ip;
+  ip_hdr->check = Checksum(reinterpret_cast<uint16_t *>(ip_hdr), IPV4_HDR_LEN);
+
+  struct KVMigrateHeader *kv_migrate_hdr =
+      reinterpret_cast<struct KVMigrateHeader *>(packet.data() + ETH_HLEN +
+                                                 IPV4_HDR_LEN);
+  kv_migrate_hdr->request_id = generate_request_id();
+  uint16_t combined = ENCODE_COMBINED(rack_id_, CACHE_MIGRATE, WRITE_REQUEST);
+  kv_migrate_hdr->combined = htons(combined);
+  kv_migrate_hdr->migration_id = migration_id;
+  kv_migrate_hdr->src_rack_id = rack_id_;
+  kv_migrate_hdr->dst_rack_id = dst_rack_id;
+  kv_migrate_hdr->cache_index = htons(index);
+  kv_migrate_hdr->total_keys = htons(index_size);
+  kv_migrate_hdr->is_last_key = is_last_key;
+
+  return packet;
+}
+
 void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
   if (fsm_ != MIGRATION_NO) {
     std::cerr << "Migration already in progress or completed.\n";
@@ -356,8 +396,6 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
   const struct MigrationInfo *migration_info_hdr =
       reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
                                                      IPV4_HDR_LEN);
-  // if (SendAsk(migration_info_hdr->request_id, controller_ip_in_))
-  //   std::cout << "[Rack " << rack_id_ << "] Send a Ask packet\n";
 
   const ClusterInfo &dst_cluster =
       (*clusters_info_)[migration_info_hdr->dst_rack_id];
@@ -367,41 +405,17 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
   auto index_to_ips = HashToIps(indices, dst_cluster.servers_ip);
 
   for (const auto &it : index_to_ips) {
-    uint32_t req_id = generate_request_id();
-    auto payload = std::make_unique<KVMigrateHeader>();
-    payload->request_id = req_id;
+    std::vector<uint8_t> c_mpacket = ConstructMigratePacket(
+        inet_addr(it.first.c_str()), server_ip_in_, it.second,
+        migration_info_hdr->migration_id, migration_info_hdr->dst_rack_id,
+        index_to_ips.size(), (it.second == index_to_ips.end()->second) ? 1 : 0);
+    auto *packet_data = new std::vector<uint8_t>(std::move(c_mpacket));
 
-    uint16_t combined = ENCODE_COMBINED(rack_id_, CACHE_MIGRATE, WRITE_REQUEST);
-    payload->combined = htons(combined);
-    payload->migration_id = migration_info_hdr->migration_id;
-    payload->src_rack_id = migration_info_hdr->src_rack_id;
-    payload->dst_rack_id = migration_info_hdr->dst_rack_id;
-    payload->cache_index = htons(it.second);
-    payload->total_keys = htons(index_to_ips.size());
-    payload->is_last_key = (it.second == index_to_ips.end()->second) ? 1 : 0;
-
-    auto packet = ConstructPacket(std::move(payload),
-                                  inet_addr(it.first.c_str()), server_ip_in_);
-
-    auto packet_data =
-        std::make_shared<std::vector<uint8_t>>(std::move(packet));
-
-    int ret = rte_ring_enqueue(kv_migration_ring_, packet_data.get());
+    int ret = rte_ring_enqueue(kv_migration_ring_, packet_data);
     if (ret < 0) {
       std::cerr << "Failed to enqueue migration packet to ring: " << ret
                 << std::endl;
       continue;
-    }
-    std::shared_ptr<int> kv_migration_event_fd =
-        kv_migration_event_fd_ptr_.lock();
-    if (kv_migration_event_fd) {
-      uint64_t val = 1;
-      ssize_t bytes_written = write(*kv_migration_event_fd, &val, sizeof(val));
-      if (bytes_written == -1) {
-        std::cerr << "Failed to write to event_fd\n";
-      }
-    } else {
-      std::cerr << "Event fd is no longer valid!\n";
     }
   }
 }

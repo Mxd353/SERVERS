@@ -88,6 +88,9 @@ class ServerInstance {
   void HandleMigrationInfo(const std::vector<uint8_t>& packet);
   std::vector<std::pair<std::string, uint>> HashToIps(
       std::vector<uint> indices, const std::vector<std::string>& ip_list);
+  inline std::vector<uint8_t> ConstructMigratePacket(
+      uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
+      uint8_t dst_rack_id, uint16_t index_size, uint8_t is_last_key);
   void StartMigration(const std::vector<uint8_t>& packet);
   std::vector<uint> SampleIndices(size_t sample_size);
   void HandleAsk(const std::vector<uint8_t>& packet);

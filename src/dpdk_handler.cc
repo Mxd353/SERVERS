@@ -251,8 +251,6 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
       struct KVHeader *kv_header = (struct KVHeader *)(ip_hdr + 1);
       rte_prefetch0(kv_header);
 
-      utils::PrintHexData(kv_header, sizeof(struct KVHeader));
-
       uint8_t op = GET_OP(kv_header->combined);
 
       uint8_t is_req = GET_IS_REQ(kv_header->combined);
@@ -354,50 +352,32 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
   RTE_LOG(NOTICE, CORE, "[Special] %u polling queue: %hu\n", lcore_id,
           queue_id);
 
-  const int timeout_ms = -1;
-  epoll_event event;
   while (true) {
-    int nfds = epoll_wait(epoll_fd_, &event, 1, timeout_ms);
-    if (nfds == -1) {
-      if (errno == EINTR) continue;
-      perror("epoll_wait");
-      break;
-    }
+    std::vector<uint8_t> *packet_data = nullptr;
+    if (rte_ring_dequeue(kv_migration_ring, (void **)&packet_data) == 0) {
+      if (packet_data) {
+        struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
+        if (!mbuf) {
+          std::cerr << "Failed to allocate mbuf" << std::endl;
+          delete packet_data;
+          continue;
+        }
+        char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
+        memcpy(mbuf_data, packet_data->data(), packet_data->size());
 
-    if (nfds == 1) {
-      if (event.data.fd != *kv_migration_event_fd_ptr_) continue;
-      uint64_t val;
-      read(*kv_migration_event_fd_ptr_, &val, sizeof(val));
-
-      std::shared_ptr<std::vector<uint8_t>> packet_data(nullptr);
-      while (rte_ring_dequeue(kv_migration_ring, (void **)&packet_data) == 0) {
-        if (packet_data) {
-          struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
-          if (!mbuf) {
-            std::cerr << "Failed to allocate mbuf" << std::endl;
-            return;
-          }
-
-          char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
-          memcpy(mbuf_data, packet_data->data(), packet_data->size());
-
-          rte_pktmbuf_data_len(mbuf) = packet_data->size();
-          rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf);
-
-          int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
-          if (ret < 1) {
-            RTE_LOG(ERR, CORE,
-                    "Failed to send packet on core %u, queue %hu: %s\n",
-                    lcore_id, queue_id, rte_strerror(-ret));
-            rte_pktmbuf_free(mbuf);
-            return;
-          }
-          // RTE_LOG(INFO, CORE, "Success to send packet on core %u, queue
-          // %hu\n",
-          //         lcore_id, queue_id);
-          packet_data.reset();
+        rte_pktmbuf_data_len(mbuf) = packet_data->size();
+        rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf);
+        delete packet_data;
+        int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
+        if (ret < 1) {
+          RTE_LOG(ERR, CORE, "Send error: %s (errno=%d)\n", rte_strerror(-ret),
+                  -ret);
+          rte_pktmbuf_free(mbuf);
+          continue;
         }
       }
+    } else {
+      rte_pause();
     }
   }
 }
