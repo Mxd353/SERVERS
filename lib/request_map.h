@@ -11,7 +11,7 @@ class RequestMap {
  public:
   using MapType = tbb::concurrent_unordered_map<U, std::shared_ptr<T>>;
 
-  bool Insert(U req_id, std::shared_ptr<T>&& req) {
+  bool Insert(U req_id, std::shared_ptr<T> req) {
     auto [it, inserted] = map_.insert({req_id, std::move(req)});
     return inserted;
   }

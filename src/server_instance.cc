@@ -153,6 +153,7 @@ void ServerInstance::SetKvMigrationRing(
 void ServerInstance::CacheMigrate(const std::string_view &key,
                                   uint32_t migration_id) {
   std::string migrate_key = std::string(key);
+  std::cout << "get a key: " << migrate_key << "\n";
   auto payload = std::make_unique<struct CacheMigrateHeader>();
   uint32_t req_id = generate_request_id();
   payload->request_id = req_id;
@@ -162,40 +163,26 @@ void ServerInstance::CacheMigrate(const std::string_view &key,
 
   auto packet =
       ConstructPacket(std::move(payload), controller_ip_in_, server_ip_in_);
-  auto request = std::make_shared<std::promise<bool>>();
-  auto future = request->get_future();
 
-  if (!request_map_.Insert(req_id, std::move(request))) {
-    std::cerr << "Duplicate request_id: " << req_id << '\n';
+  if (!SendPacket(packet)) {
+    std::cerr << "Failed to send CacheMigrate\n";
     return;
   }
-  RequestCleaner cleaner(request_map_, req_id);
+}
 
-  for (uint16_t attempt = 0; attempt < RETRIES; ++attempt) {
-    if (!SendPacket(packet)) {
-      std::cerr << "Failed to send CacheMigrate\n";
-      continue;
+void ServerInstance::HandleMigrateReply(uint32_t request_id) {
+  std::cout << "[Rack " << rack_id_ << "] Get Migrate Reply\n";
+  bool exist = request_map_.Modify(request_id, [&](auto &req) {
+    try {
+      req->set_value(true);
+    } catch (const std::future_error &e) {
+      std::cerr << "[MIGRATE_REPLY] Future error: " << e.what() << std::endl;
     }
-
-    if (future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
-      try {
-        if (future.get())
-          return;
-        else {
-          std::cerr << "CacheMigrate failed for key: " << migrate_key
-                    << " on attempt " << attempt + 1 << '\n';
-        }
-      } catch (const std::exception &e) {
-        std::cerr << "Promise future error: " << e.what() << '\n';
-      } catch (...) {
-        std::cerr << "Unknown promise error\n";
-      }
-    } else {
-      std::cerr << "Timeout waiting for CacheMigrate ACK\n";
-    }
-    exponentialBackoff(attempt);
+  });
+  if (!exist) {
+    std::cerr << "[MIGRATE_REPLY] Request not exist id: " << request_id
+              << std::endl;
   }
-  std::cerr << "Max retries exceeded";
 }
 
 template <typename PayloadType>
@@ -364,14 +351,18 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
     std::cerr << "Migration already in progress or completed.\n";
     return;
   }
+  std::cout << "[Rack " << rack_id_ << "] Get a StartMigration packet\n";
+
   const struct MigrationInfo *migration_info_hdr =
       reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
                                                      IPV4_HDR_LEN);
+  // if (SendAsk(migration_info_hdr->request_id, controller_ip_in_))
+  //   std::cout << "[Rack " << rack_id_ << "] Send a Ask packet\n";
 
   const ClusterInfo &dst_cluster =
       (*clusters_info_)[migration_info_hdr->dst_rack_id];
 
-  std::vector<uint> indices = SampleIndices(CACHE_SIZE / 2);
+  std::vector<uint> indices = SampleIndices(CHUNK_SIZE);
 
   auto index_to_ips = HashToIps(indices, dst_cluster.servers_ip);
 
@@ -379,8 +370,9 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
     uint32_t req_id = generate_request_id();
     auto payload = std::make_unique<KVMigrateHeader>();
     payload->request_id = req_id;
-    payload->combined = ENCODE_COMBINED(rack_id_, CACHE_MIGRATE, WRITE_REQUEST);
 
+    uint16_t combined = ENCODE_COMBINED(rack_id_, CACHE_MIGRATE, WRITE_REQUEST);
+    payload->combined = htons(combined);
     payload->migration_id = migration_info_hdr->migration_id;
     payload->src_rack_id = migration_info_hdr->src_rack_id;
     payload->dst_rack_id = migration_info_hdr->dst_rack_id;
@@ -394,59 +386,28 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
     auto packet_data =
         std::make_shared<std::vector<uint8_t>>(std::move(packet));
 
-    auto request = std::make_shared<std::promise<bool>>();
-    auto future = request->get_future();
-
-    if (!request_map_.Insert(req_id, std::move(request))) {
-      std::cerr << "Duplicate request_id: " << req_id << '\n';
-      break;
+    int ret = rte_ring_enqueue(kv_migration_ring_, packet_data.get());
+    if (ret < 0) {
+      std::cerr << "Failed to enqueue migration packet to ring: " << ret
+                << std::endl;
+      continue;
     }
-
-    RequestCleaner cleaner(request_map_, req_id);
-
-    bool success = false;
-    for (uint16_t attempt = 0; attempt < RETRIES; ++attempt) {
-      int ret = rte_ring_enqueue(kv_migration_ring_, packet_data.get());
-      if (ret < 0) {
-        std::cerr << "Failed to enqueue migration packet to ring: " << ret
-                  << std::endl;
-        continue;
+    std::shared_ptr<int> kv_migration_event_fd =
+        kv_migration_event_fd_ptr_.lock();
+    if (kv_migration_event_fd) {
+      uint64_t val = 1;
+      ssize_t bytes_written = write(*kv_migration_event_fd, &val, sizeof(val));
+      if (bytes_written == -1) {
+        std::cerr << "Failed to write to event_fd\n";
       }
-
-      std::shared_ptr<int> kv_migration_event_fd =
-          kv_migration_event_fd_ptr_.lock();
-      if (kv_migration_event_fd) {
-        uint64_t val = 1;
-        ssize_t bytes_written =
-            write(*kv_migration_event_fd, &val, sizeof(val));
-        if (bytes_written == -1) {
-          std::cerr << "Failed to write to event_fd\n";
-        }
-      } else {
-        std::cerr << "Event fd is no longer valid!\n";
-      }
-
-      if (future.wait_for(std::chrono::seconds(2)) ==
-          std::future_status::ready) {
-        try {
-          if (future.get()) {
-            success = true;
-            break;
-          }
-        } catch (const std::exception &e) {
-          std::cerr << "Promise future error: " << e.what() << '\n';
-        } catch (...) {
-          std::cerr << "Unknown promise error\n";
-        }
-      }
-      exponentialBackoff(attempt);
+    } else {
+      std::cerr << "Event fd is no longer valid!\n";
     }
-    if (!success) std::cerr << "Max retries exceeded";
   }
 }
 
 std::vector<uint> ServerInstance::SampleIndices(size_t sample_size) {
-  std::vector<uint> indices(index_base_ - index_limit_);
+  std::vector<uint> indices(index_limit_ - index_base_);
   std::iota(indices.begin(), indices.end(), index_base_);
   std::random_device rd;
   std::mt19937 gen(rd());

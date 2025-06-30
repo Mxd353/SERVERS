@@ -11,21 +11,13 @@
 #include <fstream>
 #include <iostream>
 
+#include "lib/utils.h"
+
 struct CustomPacket {
   rte_ether_hdr eth_hdr;
   rte_ipv4_hdr ip_hdr;
   KVHeader kv_header;
 };
-
-void ReverseRTE_IPV4(uint32_t ip, std::string &result) {
-  uint8_t a = (ip >> 24) & 0xFF;
-  uint8_t b = (ip >> 16) & 0xFF;
-  uint8_t c = (ip >> 8) & 0xFF;
-  uint8_t d = ip & 0xFF;
-
-  result = std::to_string(d) + "." + std::to_string(c) + "." +
-           std::to_string(b) + "." + std::to_string(a);
-}
 
 const uint32_t custom_packet_len = sizeof(CustomPacket);
 
@@ -252,44 +244,52 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
 
   if (ip_hdr->next_proto_id == IP_PROTOCOLS_NETCACHE) {
     SwapMac(eth_hdr);
+
     rte_be32_t dst_addr = ip_hdr->dst_addr;
+
     if (auto db = GetDbByIp(dst_addr)) {
       struct KVHeader *kv_header = (struct KVHeader *)(ip_hdr + 1);
       rte_prefetch0(kv_header);
 
+      utils::PrintHexData(kv_header, sizeof(struct KVHeader));
+
       uint8_t op = GET_OP(kv_header->combined);
 
       uint8_t is_req = GET_IS_REQ(kv_header->combined);
-      if (is_req == CLIENT_REQUEST) kv_header->combined |= 0x1000; // SERVER_REPLY << 12
+      if (is_req == CLIENT_REQUEST)
+        kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
+
+      if (is_req == CACHE_REPLY)
+        RTE_LOG(WARNING, DB, "reci a CACHE_REPLY!!!\n");
 
       auto value_ptr = kv_header->value1.data();
+
       std::string_view key{kv_header->key.data(), KEY_LENGTH};
 
       if (op == WRITE_REQUEST) {
         db->set(key, std::string_view(value_ptr, VALUE_LENGTH * 4));
 
         if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
-          RTE_LOG(INFO, DB, "Receive a %s packet\n",
-                  is_req == WRITE_MIRROR ? "WRITE_MIRROR" : "CACHE_MIGRATE");
           struct KVMigrateHeader *kv_migration_header =
               (struct KVMigrateHeader *)(kv_header);
+
           if (auto server = GetServerByIp(dst_addr))
-            server->CacheMigrate(
-                key, rte_be_to_cpu_32(kv_migration_header->migration_id));
-          if (is_req == WRITE_MIRROR) {
-            rte_pktmbuf_free(mbuf);
-            return;
-          } else if (is_req == CACHE_MIGRATE) {
-            kv_header->combined |= 0x6000; // MIGRATE_REPLY << 12
-          }
+            server->CacheMigrate(key, kv_migration_header->migration_id);
+
+          rte_pktmbuf_free(mbuf);
+          return;
+
+        } else if (is_req == MIGRATE_REPLY) {
+          if (auto server = GetServerByIp(dst_addr))
+            server->HandleMigrateReply(kv_header->request_id);
         }
       } else if (op == READ_REQUEST) {
-        if (auto val = db->get(key)) {
-          memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
-        } else {
-          RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
-                  DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
-        }
+        // if (auto val = db->get(key)) {
+        //   memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
+        // } else {
+        //   RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
+        //           DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
+        // }
       }
     } else {
       RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n",
@@ -326,9 +326,8 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
           "not be optimal.\n",
           port);
 
-    RTE_LOG(NOTICE, WORKER,
-            "[Normal] Core: %u polling queue: %hu on socket %u\n", lcore_id,
-            queue_id, rte_lcore_to_socket_id(lcore_id));
+    RTE_LOG(NOTICE, CORE, "[Normal] %u polling queue: %hu on socket %u\n",
+            lcore_id, queue_id, rte_lcore_to_socket_id(lcore_id));
     struct rte_mbuf *bufs[BURST_SIZE];
     while (true) {
       const uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
@@ -352,7 +351,7 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
   uint lcore_id = core_info.first;
   uint16_t queue_id = core_info.second;
 
-  RTE_LOG(NOTICE, WORKER, "[Special] Core: %u polling queue: %hu\n", lcore_id,
+  RTE_LOG(NOTICE, CORE, "[Special] %u polling queue: %hu\n", lcore_id,
           queue_id);
 
   const int timeout_ms = -1;
@@ -387,12 +386,15 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
 
           int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
           if (ret < 1) {
-            RTE_LOG(ERR, WORKER,
+            RTE_LOG(ERR, CORE,
                     "Failed to send packet on core %u, queue %hu: %s\n",
                     lcore_id, queue_id, rte_strerror(-ret));
             rte_pktmbuf_free(mbuf);
             return;
           }
+          // RTE_LOG(INFO, CORE, "Success to send packet on core %u, queue
+          // %hu\n",
+          //         lcore_id, queue_id);
           packet_data.reset();
         }
       }

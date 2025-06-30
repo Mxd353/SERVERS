@@ -14,8 +14,8 @@
 #include <string>
 #include <thread>
 
-#include "lib/request_map.h"
 #include "lib/c_m_proto.h"
+#include "lib/request_map.h"
 
 constexpr size_t CHUNK_SIZE = 32;
 
@@ -45,6 +45,7 @@ class ServerInstance {
   void SetKvMigrationRing(struct rte_ring* ring,
                           std::shared_ptr<int> kv_migration_event_fd_ptr);
   void CacheMigrate(const std::string_view& key, uint32_t migration_id);
+  void HandleMigrateReply(uint32_t request_id);
 
  private:
   uint8_t src_mac_[ETH_ALEN];
