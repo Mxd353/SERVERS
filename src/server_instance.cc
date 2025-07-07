@@ -46,15 +46,12 @@ static inline void exponentialBackoff(int attempt) {
 
 ServerInstance::ServerInstance(
     const std::string &server_ip, int rack_id, int db,
-    const std::string &iface_to_controller, const std::string &controller_mac,
-    const std::string &controller_ip,
-    std::shared_ptr<const std::vector<ClusterInfo>> clusters_info)
+    std::shared_ptr<const ControllerInfo> controller_info,
+    std::shared_ptr<const std::vector<std::vector<std::string>>> clusters_info)
     : server_ip_(server_ip),
       rack_id_(rack_id),
       db_(db),
-      iface_to_controller_(iface_to_controller),
-      controller_mac_(utils::parse_mac(controller_mac)),
-      controller_ip_(controller_ip),
+      controller_info_(std::move(controller_info)),
       clusters_info_(std::move(clusters_info)),
       fsm_(MIGRATION_NO) {
   sockfd_ = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
@@ -104,7 +101,8 @@ ServerInstance::~ServerInstance() {
 bool ServerInstance::Start() {
   try {
     if (running_) {
-      std::cerr << "[Rack " << rack_id_ << "] Server " << server_ip_ << " already running." << std::endl;
+      std::cerr << "[Rack " << rack_id_ << "] Server " << server_ip_
+                << " already running." << std::endl;
       return false;
     }
 
@@ -395,8 +393,7 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
       reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
                                                      IPV4_HDR_LEN);
 
-  const ClusterInfo &dst_cluster =
-      (*clusters_info_)[migration_info_hdr->dst_rack_id];
+  const auto &dst_cluster = (*clusters_info_)[migration_info_hdr->dst_rack_id];
 
   std::vector<uint> indices;
 
@@ -406,7 +403,7 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
     indices.push_back(i);
   }
 
-  auto index_to_ips = HashToIps(indices, dst_cluster.servers_ip);
+  auto index_to_ips = HashToIps(indices, dst_cluster);
 
   for (const auto &it : index_to_ips) {
     std::vector<uint8_t> c_mpacket = ConstructMigratePacket(

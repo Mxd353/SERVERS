@@ -23,16 +23,13 @@ class ServerInstance {
   typedef std::pair<std::string, std::string> KVPair;
 
   struct ClusterInfo {
-    std::string iface_to_controller;
-    std::string controller_ip;
     std::vector<std::string> servers_ip;
   };
 
   ServerInstance(const std::string& server_ip, int rack_id, int db,
-                 const std::string& iface_to_controller,
-                 const std::string& controller_mac,
-                 const std::string& controller_ip,
-                 std::shared_ptr<const std::vector<ClusterInfo>> clusters_info);
+                 std::shared_ptr<const ControllerInfo> controller_info,
+                 std::shared_ptr<const std::vector<std::vector<std::string>>>
+                     clusters_info);
   ~ServerInstance();
 
   bool Start();
@@ -51,6 +48,7 @@ class ServerInstance {
   std::string server_ip_;
   int rack_id_;
   int db_;
+  std::shared_ptr<const ControllerInfo> controller_info_;
   std::string iface_to_controller_;
   std::array<uint8_t, ETH_ALEN> controller_mac_;
   std::string controller_ip_;
@@ -58,7 +56,7 @@ class ServerInstance {
   uint32_t server_ip_in_;
   uint32_t controller_ip_in_;
 
-  std::shared_ptr<const std::vector<ClusterInfo>> clusters_info_;
+  std::shared_ptr<const std::vector<std::vector<std::string>>> clusters_info_;
 
   uint index_base_;
   uint index_limit_;

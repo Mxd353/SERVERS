@@ -49,6 +49,12 @@ constexpr uint8_t MIGRATION_START = 1;
 constexpr uint8_t MIGRATION_DONE = 2;
 constexpr uint8_t MIGRATION_TRANSFER_DONE = 6;
 
+struct ControllerInfo {
+    std::string iface;
+    std::string ip;
+    std::string mac;
+  };
+
 #pragma pack(push, 1)
 struct BaseHeader {
   uint32_t request_id = 0;
