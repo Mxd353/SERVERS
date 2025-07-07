@@ -3,7 +3,6 @@
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <rte_ring.h>
-#include <sw/redis++/async_redis++.h>
 #include <sw/redis++/redis++.h>
 
 #include <atomic>
@@ -17,7 +16,7 @@
 #include "lib/c_m_proto.h"
 #include "lib/request_map.h"
 
-constexpr size_t CHUNK_SIZE = 32;
+constexpr size_t CHUNK_SIZE = 128;
 
 class ServerInstance {
  public:
@@ -53,7 +52,7 @@ class ServerInstance {
   int rack_id_;
   int db_;
   std::string iface_to_controller_;
-  std::string controller_mac_;
+  std::array<uint8_t, ETH_ALEN> controller_mac_;
   std::string controller_ip_;
 
   uint32_t server_ip_in_;
@@ -90,7 +89,7 @@ class ServerInstance {
       std::vector<uint> indices, const std::vector<std::string>& ip_list);
   inline std::vector<uint8_t> ConstructMigratePacket(
       uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
-      uint8_t dst_rack_id, uint16_t index_size, uint8_t is_last_key);
+      uint8_t dst_rack_id, uint16_t index_size);
   void StartMigration(const std::vector<uint8_t>& packet);
   std::vector<uint> SampleIndices(size_t sample_size);
   void HandleAsk(const std::vector<uint8_t>& packet);

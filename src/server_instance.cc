@@ -1,14 +1,12 @@
 #include "server_instance.h"
 
 #include <linux/if_packet.h>
-#include <net/ethernet.h>
 #include <net/if.h>
 #include <openssl/sha.h>
 #include <pcap.h>
 #include <sw/redis++/errors.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#include <zlib.h>
 
 #include <chrono>
 #include <optional>
@@ -55,7 +53,7 @@ ServerInstance::ServerInstance(
       rack_id_(rack_id),
       db_(db),
       iface_to_controller_(iface_to_controller),
-      controller_mac_(controller_mac),
+      controller_mac_(utils::parse_mac(controller_mac)),
       controller_ip_(controller_ip),
       clusters_info_(std::move(clusters_info)),
       fsm_(MIGRATION_NO) {
@@ -106,20 +104,15 @@ ServerInstance::~ServerInstance() {
 bool ServerInstance::Start() {
   try {
     if (running_) {
-      std::cout << "Server already running." << std::endl;
+      std::cerr << "[Rack " << rack_id_ << "] Server " << server_ip_ << " already running." << std::endl;
       return false;
     }
 
     running_ = true;
 
-    redis_ = std::make_unique<sw::redis::Redis>("tcp://127.0.0.1:6379/" +
-                                                std::to_string(db_));
     recv_thread_ = std::thread(&ServerInstance::ReceiveThread, this);
-    std::cout << "[Rack " << rack_id_ << "] Server " << server_ip_
-              << " running...\n";
 
     return running_;
-
   } catch (const std::exception &e) {
     std::cerr << "Failed to start server: " << e.what() << std::endl;
     running_ = false;
@@ -135,8 +128,6 @@ bool ServerInstance::Start() {
 void ServerInstance::Stop() {
   if (running_) {
     running_ = false;
-    std::cout << "[Rack " << rack_id_ << "] Server " << server_ip_
-              << " stopped.\n";
   }
 }
 
@@ -148,16 +139,24 @@ void ServerInstance::SetKvMigrationRing(
 
 void ServerInstance::CacheMigrate(const std::string_view &key,
                                   uint32_t migration_id) {
+  if (key.empty()) {
+    std::cerr << "Error: key is empty!\n";
+    return;
+  }
   std::string migrate_key = std::string(key);
-  auto payload = std::make_unique<struct CacheMigrateHeader>();
-  uint32_t req_id = generate_request_id();
-  payload->request_id = req_id;
-  payload->migration_id = migration_id;
-  std::memset(payload->key.data(), 0, KEY_LENGTH);
-  std::memcpy(payload->key.data(), key.data(), KEY_LENGTH);
+  if (migrate_key.find('\0') != std::string::npos ||
+      migrate_key.size() < KEY_LENGTH)
+    return;
 
-  auto packet =
-      ConstructPacket(std::move(payload), controller_ip_in_, server_ip_in_);
+  auto cache_migrate = std::make_unique<struct CacheMigrateHeader>();
+  uint32_t req_id = generate_request_id();
+  cache_migrate->request_id = req_id;
+  cache_migrate->migration_id = migration_id;
+  std::memset(cache_migrate->key.data(), 0, KEY_LENGTH);
+  std::memcpy(cache_migrate->key.data(), migrate_key.data(), KEY_LENGTH);
+
+  auto packet = ConstructPacket(std::move(cache_migrate), controller_ip_in_,
+                                server_ip_in_);
 
   if (!SendPacket(packet)) {
     std::cerr << "Failed to send CacheMigrate\n";
@@ -230,7 +229,7 @@ bool ServerInstance::SendPacket(const std::vector<uint8_t> &packet) {
   dest_addr.sll_family = AF_PACKET;
   dest_addr.sll_ifindex = ifindex_;
   dest_addr.sll_halen = ETH_ALEN;
-  memcpy(dest_addr.sll_addr, eth_hdr->h_dest, 6);
+  memcpy(dest_addr.sll_addr, eth_hdr->h_dest, ETH_ALEN);
 
   ssize_t bytes_sent = sendto(sockfd_, packet.data(), packet.size(), 0,
                               (struct sockaddr *)&dest_addr, addrlen);
@@ -343,7 +342,7 @@ std::vector<std::pair<std::string, uint>> ServerInstance::HashToIps(
 
 inline std::vector<uint8_t> ServerInstance::ConstructMigratePacket(
     uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
-    uint8_t dst_rack_id, uint16_t index_size, uint8_t is_last_key) {
+    uint8_t dst_rack_id, uint16_t index_size) {
   size_t payload_size = sizeof(struct KVMigrateHeader);
   size_t total_size = ETH_HLEN + IPV4_HDR_LEN + payload_size;
   std::vector<uint8_t> packet(total_size);
@@ -381,17 +380,16 @@ inline std::vector<uint8_t> ServerInstance::ConstructMigratePacket(
   kv_migrate_hdr->dst_rack_id = dst_rack_id;
   kv_migrate_hdr->cache_index = htons(index);
   kv_migrate_hdr->total_keys = htons(index_size);
-  kv_migrate_hdr->is_last_key = is_last_key;
 
   return packet;
 }
 
 void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
-  if (fsm_ != MIGRATION_NO) {
-    std::cerr << "Migration already in progress or completed.\n";
-    return;
-  }
-  std::cout << "[Rack " << rack_id_ << "] Get a StartMigration packet\n";
+  // if (fsm_ != MIGRATION_NO) {
+  //   std::cerr << "Migration already in progress or completed.\n";
+  //   return;
+  // }
+  // std::cout << "[Rack " << rack_id_ << "] Get a StartMigration packet\n";
 
   const struct MigrationInfo *migration_info_hdr =
       reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
@@ -400,7 +398,13 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
   const ClusterInfo &dst_cluster =
       (*clusters_info_)[migration_info_hdr->dst_rack_id];
 
-  std::vector<uint> indices = SampleIndices(CHUNK_SIZE);
+  std::vector<uint> indices;
+
+  indices.reserve(CHUNK_SIZE);
+
+  for (uint i = index_base_; i <= (index_base_ + CHUNK_SIZE); ++i) {
+    indices.push_back(i);
+  }
 
   auto index_to_ips = HashToIps(indices, dst_cluster.servers_ip);
 
@@ -408,7 +412,7 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
     std::vector<uint8_t> c_mpacket = ConstructMigratePacket(
         inet_addr(it.first.c_str()), server_ip_in_, it.second,
         migration_info_hdr->migration_id, migration_info_hdr->dst_rack_id,
-        index_to_ips.size(), (it.second == index_to_ips.end()->second) ? 1 : 0);
+        index_to_ips.size());
     auto *packet_data = new std::vector<uint8_t>(std::move(c_mpacket));
 
     int ret = rte_ring_enqueue(kv_migration_ring_, packet_data);
@@ -417,6 +421,7 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
                 << std::endl;
       continue;
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
 }
 
