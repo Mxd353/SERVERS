@@ -9,13 +9,14 @@
 using ClusterInfo = ServerCluster::ClusterInfo;
 
 std::atomic<bool> exit_requested(false);
-std::unique_ptr<ServerCluster> cluster;
+std::unique_ptr<ServerCluster> clusters;
 
 void signalHandler(int signal) {
   std::cout << "\nReceived shutdown signal: " << signal << std::endl;
   exit_requested = true;
-  if (cluster) {
-    cluster->StopAll();
+  if (clusters) {
+    clusters->StopAll();
+    std::cout << "All clusters stop" << std::endl;
   }
   std::exit(0);
 }
@@ -79,9 +80,9 @@ int main(int argc, char* argv[]) {
 
   auto dpdk_hander = std::make_shared<DPDKHandler>();
 
-  std::cout << "Starting server cluster >>" << std::endl;
-  cluster = std::make_unique<ServerCluster>(clusters_info);
-  auto servers = cluster->StartAll();
+  std::cout << "RUN: Starting server cluster >>" << std::endl;
+  clusters = std::make_unique<ServerCluster>(clusters_info);
+  auto servers = clusters->StartAll();
 
   bool success = dpdk_hander->Initialize(dpdk_conf, progrom_name, servers);
   if (!success) {
