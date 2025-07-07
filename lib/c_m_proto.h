@@ -26,7 +26,7 @@
 #define KEY_LENGTH 16
 #define VALUE_LENGTH 4
 
-constexpr size_t CACHE_SIZE = 1024;
+constexpr size_t CACHE_SIZE = 256;
 
 constexpr uint16_t RETRIES = 3;
 
@@ -71,8 +71,6 @@ struct KVMigrateHeader : public KVHeader {  // pick up from KVHeader
   uint8_t dst_rack_id = 0;
   uint16_t cache_index = 0;
   uint16_t total_keys = 0;
-  uint8_t is_last_key = 0;
-  uint8_t padding = 0;  // Padding to align to 8 bytes
 };
 
 struct MigrationInfo : public BaseHeader {
