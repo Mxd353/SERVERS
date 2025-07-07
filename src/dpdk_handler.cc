@@ -49,6 +49,7 @@ DPDKHandler::~DPDKHandler() {
 
 inline void DPDKHandler::BuildIptoServerMap(
     const std::vector<std::shared_ptr<ServerInstance>> &servers) {
+  uint db_size = 0;
   for (const auto &server : servers) {
     if (!server) {
       RTE_LOG(ERR, DB, "Invalid ServerInstance pointer!\n");
@@ -58,9 +59,10 @@ inline void DPDKHandler::BuildIptoServerMap(
     rte_be32_t be32_ip = server->GetIp();
     auto redis = std::make_shared<sw::redis::Redis>(
         "tcp://127.0.0.1:6379/" + std::to_string(server->GetDb()));
-    RTE_LOG(INFO, DB, "Init Redis index: %d \n", server->GetDb());
     ip_to_server_.emplace(be32_ip, std::make_pair(server, redis));
+    db_size++;
   }
+  RTE_LOG(INFO, DB, "Init %d Redis for servers.\n", db_size);
 }
 
 bool DPDKHandler::Initialize(
@@ -270,7 +272,8 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
         if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
           struct KVMigrateHeader *kv_migration_header =
               (struct KVMigrateHeader *)(kv_header);
-
+          // utils::PrintHexData(kv_migration_header,
+          //                     sizeof(struct KVMigrateHeader));
           if (auto server = GetServerByIp(dst_addr))
             server->CacheMigrate(key, kv_migration_header->migration_id);
 
@@ -324,8 +327,8 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
           "not be optimal.\n",
           port);
 
-    RTE_LOG(NOTICE, CORE, "[Normal] %u polling queue: %hu on socket %u\n",
-            lcore_id, queue_id, rte_lcore_to_socket_id(lcore_id));
+    RTE_LOG(NOTICE, CORE, "[Normal] %u polling queue: %hu\n", lcore_id,
+            queue_id);
     struct rte_mbuf *bufs[BURST_SIZE];
     while (true) {
       const uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
