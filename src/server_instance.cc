@@ -43,10 +43,8 @@ ServerInstance::ServerInstance(
 
 ServerInstance::~ServerInstance() {}
 
-void ServerInstance::SetKvMigrationRing(
-    struct rte_ring *ring, std::shared_ptr<int> kv_migration_event_fd_ptr) {
+void ServerInstance::SetKvMigrationRing(struct rte_ring *ring) {
   kv_migration_ring_ = ring;
-  kv_migration_event_fd_ptr_ = kv_migration_event_fd_ptr;
 }
 
 void ServerInstance::CacheMigrate(const std::string_view &key,

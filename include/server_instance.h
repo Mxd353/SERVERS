@@ -37,8 +37,7 @@ class ServerInstance {
   [[nodiscard]] uint32_t GetIp() const noexcept { return server_ip_in_; }
   [[nodiscard]] int GetDb() const noexcept { return server_info_.db; }
 
-  void SetKvMigrationRing(struct rte_ring* ring,
-                          std::shared_ptr<int> kv_migration_event_fd_ptr);
+  void SetKvMigrationRing(struct rte_ring* ring);
   void CacheMigrate(const std::string_view& key, uint32_t migration_id);
   void HandlePacket(const std::vector<uint8_t>& packet);
 
@@ -75,5 +74,4 @@ class ServerInstance {
       uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
       uint8_t dst_rack_id, uint16_t index_size);
   void StartMigration(const std::vector<uint8_t>& packet);
-  std::vector<uint> SampleIndices(size_t sample_size);
 };

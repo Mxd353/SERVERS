@@ -26,15 +26,10 @@ std::ofstream outfile("server.output");
 DPDKHandler::DPDKHandler() {}
 
 DPDKHandler::~DPDKHandler() {
+  std::cout << "[DPDK] DPDKHandler destructor called\n";
   if (initialized_) {
+    std::cout << "[DPDK] Cleanup triggered\n";
     initialized_ = false;
-
-    if (kv_migration_event_fd_ptr_ && *kv_migration_event_fd_ptr_ != -1) {
-      close(*kv_migration_event_fd_ptr_);
-    }
-    if (epoll_fd_ != -1) {
-      close(epoll_fd_);
-    }
 
     uint16_t port = 0;
     rte_eth_dev_stop(port);
@@ -43,7 +38,7 @@ DPDKHandler::~DPDKHandler() {
     rte_ring_free(kv_migration_ring);
 
     rte_eal_cleanup();
-    printf("Bye...\n");
+    std::cout << "Bye..." << std::endl;
   }
 }
 
@@ -100,10 +95,8 @@ bool DPDKHandler::Initialize(
     rte_exit(EXIT_FAILURE, "Cannot create kv_migration_ring\n");
   }
 
-  EventInit();
-
   for (const auto &server : servers) {
-    server.second->SetKvMigrationRing(kv_migration_ring, kv_migration_event_fd_ptr_);
+    server.second->SetKvMigrationRing(kv_migration_ring);
   }
 
   nb_ports = rte_eth_dev_count_avail();
@@ -111,32 +104,6 @@ bool DPDKHandler::Initialize(
 
   initialized_ = true;
   return initialized_;
-}
-
-void DPDKHandler::EventInit() {
-  kv_migration_event_fd_ptr_ = std::make_shared<int>(-1);
-  *kv_migration_event_fd_ptr_ = eventfd(0, EFD_NONBLOCK);
-
-  if (*kv_migration_event_fd_ptr_ == -1) {
-    perror("eventfd");
-    exit(EXIT_FAILURE);
-  }
-
-  epoll_fd_ = epoll_create1(0);
-
-  if (epoll_fd_ == -1) {
-    perror("epoll_create1");
-    exit(EXIT_FAILURE);
-  }
-
-  epoll_event ev1;
-  ev1.events = EPOLLIN;
-  ev1.data.fd = *kv_migration_event_fd_ptr_;
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, *kv_migration_event_fd_ptr_, &ev1) ==
-      -1) {
-    perror("epoll_ctl kv_migration_event_fd_");
-    exit(EXIT_FAILURE);
-  }
 }
 
 inline void DPDKHandler::SwapMac(struct rte_ether_hdr *eth_hdr) {
@@ -315,9 +282,7 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
   uint16_t queue_id = core_info.second;
 
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
-    printf("Invalid lcore_id=%u\n", lcore_id);
     rte_exit(EXIT_FAILURE, "Invalid lcore_id=%u\n", lcore_id);
-    return;
   }
   if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
     if (rte_eth_dev_socket_id(port) >= 0 &&

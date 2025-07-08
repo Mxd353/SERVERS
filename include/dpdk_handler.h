@@ -38,16 +38,12 @@ class DPDKHandler {
  private:
   volatile bool initialized_ = false;
   struct rte_mempool* mbuf_pool_;
-  // std::unordered_map<int, rte_mempool*> mbuf_pools_;
   int ret_;
   struct rte_ether_addr s_eth_addr_;
   std::shared_mutex ip_map_mutex_;
   std::unordered_map<rte_be32_t, ServerPair> ip_to_server_;
   std::vector<CoreInfo> special_cores_;
   std::vector<CoreInfo> normal_cores_;
-
-  std::shared_ptr<int> kv_migration_event_fd_ptr_;
-  int epoll_fd_ = -1;
 
   struct CoreArgs {
     CoreInfo core_info;
@@ -56,7 +52,6 @@ class DPDKHandler {
 
   std::vector<std::unique_ptr<CoreArgs>> core_args_;
 
-  void EventInit();
   void ProcessReceivedPacket(struct rte_mbuf* mbuf, uint16_t port,
                              uint16_t queue_id);
   static inline void SwapMac(struct rte_ether_hdr* eth_hdr);
