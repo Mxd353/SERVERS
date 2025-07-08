@@ -11,15 +11,48 @@ void ServerCluster::InitServers() {
   auto controller_info =
       std::make_shared<const ControllerInfo>(controller_info_);
 
-  for (size_t rack_idx = 0; rack_idx < clusters_info_.size(); ++rack_idx) {
-    std::vector<std::shared_ptr<ServerInstance>> servers;
-    for (const auto& ip : clusters_info_[rack_idx]) {
-      auto server = std::make_shared<ServerInstance>(
-          ip, rack_idx, db++, controller_info, shared_clusters);
-      servers.push_back(server);
-    }
-    clusters_.push_back(servers);
+  if (!InitSocket()) {
+    std::cerr << "Faile to init socket." << std::endl;
+    return;
   }
+
+  auto sock_config =
+      std::make_shared<const SockConfig>(SockConfig{sockfd_, ifindex_});
+
+  for (size_t rack_idx = 0; rack_idx < clusters_info_.size(); ++rack_idx) {
+    for (const auto &ip : clusters_info_[rack_idx]) {
+      ServerInstance::ServerInfo server_info = {static_cast<int>(rack_idx), ip,
+                                                src_mac_, db++};
+      auto server = std::make_shared<ServerInstance>(
+          server_info, sock_config, controller_info, shared_clusters);
+      rte_be32_t be32_ip = server->GetIp();
+      ip_to_server_.emplace(be32_ip, server);
+    }
+  }
+  std::cout << "Start " << ip_to_server_.size() << " servers from "
+            << clusters_info_.size() << "racks.\n";
+}
+
+ServerCluster::~ServerCluster() { Stop(); }
+
+void ServerCluster::Start(int thread_count) {
+  StartReceiveThreads(thread_count);
+}
+
+void ServerCluster::Stop() {
+  stop_receive_thread_.store(true, std::memory_order_relaxed);
+
+  for (auto &t : receive_threads_) {
+    if (t.joinable()) t.join();
+  }
+  receive_threads_.clear();
+
+  if (sockfd_ >= 0) {
+    close(sockfd_);
+    sockfd_ = -1;
+  }
+
+  worker_pool_.join();
 }
 
 bool ServerCluster::InitSocket() {
@@ -40,7 +73,7 @@ bool ServerCluster::InitSocket() {
   struct ifreq ifr;
   memset(&ifr, 0, sizeof(ifr));
   snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s",
-           iface_to_controller_.c_str());
+           controller_info_.iface.c_str());
 
   if (ioctl(sockfd_, SIOCGIFINDEX, &ifr) < 0) {
     close(sockfd_);
@@ -53,21 +86,71 @@ bool ServerCluster::InitSocket() {
     close(sockfd_);
     throw std::runtime_error("ioctl(SIOCGIFHWADDR) failed");
   }
-  memcpy(src_mac_, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+  memcpy(src_mac_.data(), ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+
+  return true;
 }
 
-std::vector<std::shared_ptr<ServerInstance>> ServerCluster::StartAll() {
-  std::vector<std::shared_ptr<ServerInstance>> successful_servers;
-  for (auto& cluster : clusters_) {
-    successful_servers.push_back(server);
+void ServerCluster::StartReceiveThreads(int thread_count) {
+  for (int i = 0; i < thread_count; ++i) {
+    receive_threads_.emplace_back(&ServerCluster::ReceiveThread, this);
   }
-  std::cout << "CLUTERS: Start " << successful_servers.size() << " servers for "
-            << clusters_info_.size() << " racks.\n";
-  return successful_servers;
 }
 
-void ServerCluster::StopAll() {
-  for (auto& server : servers_) {
-    server->Stop();
+void ServerCluster::ReceiveThread() {
+  constexpr int BUFFER_SIZE = 2048;
+  constexpr int MAX_RETRIES = 5;
+
+  struct sockaddr_ll src_addr = {};
+  socklen_t addrlen = sizeof(src_addr);
+  int error_count = 0;
+
+  while (!stop_receive_thread_.load(std::memory_order_relaxed)) {
+    std::vector<uint8_t> buffer(BUFFER_SIZE);
+    ssize_t recvlen =
+        recvfrom(sockfd_, buffer.data(), buffer.size(), MSG_DONTWAIT,
+                 (struct sockaddr *)&src_addr, &addrlen);
+    if (recvlen > 0) {
+      error_count = 0;
+      struct ethhdr *eth_hdr = reinterpret_cast<struct ethhdr *>(buffer.data());
+      if (memcmp(eth_hdr->h_source, src_mac_.data(), ETH_ALEN) == 0) continue;
+      if (ntohs(eth_hdr->h_proto) != ETH_P_IP) continue;
+      if (recvlen < ETH_HLEN + IPV4_HDR_LEN) {
+        std::cerr << "[Recv] Packet too short: " << recvlen << " bytes.\n";
+        continue;
+      }
+      struct iphdr *ip_hdr =
+          reinterpret_cast<struct iphdr *>(buffer.data() + ETH_HLEN);
+      if (!IsValidDstIp(ip_hdr->daddr)) {
+        buffer.resize(recvlen);
+        boost::asio::post(worker_pool_,
+                          [this, packet = std::move(buffer)]() mutable {
+                            ProcessPacket(packet);
+                          });
+      }
+    } else if (recvlen == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+      perror("[Recv] recvfrom error");
+      if (++error_count >= MAX_RETRIES) {
+        std::cerr << "[Recv] Reached max error count, exiting.\n";
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
   }
+  std::cout << "[Recv] Thread exiting cleanly.\n";
+}
+
+void ServerCluster::ProcessPacket(const std::vector<uint8_t> &packet) {
+  const struct iphdr *ip_hdr =
+      reinterpret_cast<const struct iphdr *>(packet.data() + ETH_HLEN);
+  if (auto server = GetServerByIp(ip_hdr->daddr)) {
+    server->HandlePacket(packet);
+  }
+}
+
+const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>> &
+ServerCluster::GetIpToServerMap() const {
+  return ip_to_server_;
 }

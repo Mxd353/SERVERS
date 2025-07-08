@@ -27,7 +27,7 @@
 #define VALUE_LENGTH 4
 
 constexpr size_t CACHE_SIZE = 256;
-
+constexpr size_t CHUNK_SIZE = 128;
 constexpr uint16_t RETRIES = 3;
 
 // op
@@ -50,10 +50,15 @@ constexpr uint8_t MIGRATION_DONE = 2;
 constexpr uint8_t MIGRATION_TRANSFER_DONE = 6;
 
 struct ControllerInfo {
-    std::string iface;
-    std::string ip;
-    std::string mac;
-  };
+  std::string iface;
+  std::string ip;
+  std::array<uint8_t, ETH_ALEN> mac;
+};
+
+struct SockConfig {
+  int sockfd;
+  int ifindex;
+};
 
 #pragma pack(push, 1)
 struct BaseHeader {

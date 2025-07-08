@@ -45,89 +45,22 @@ static inline void exponentialBackoff(int attempt) {
 }
 
 ServerInstance::ServerInstance(
-    const std::string &server_ip, int rack_id, int db,
+    const ServerInfo &server_info,
+    std::shared_ptr<const SockConfig> sock_config,
     std::shared_ptr<const ControllerInfo> controller_info,
-    std::shared_ptr<const std::vector<std::vector<std::string>>> clusters_info)
-    : server_ip_(server_ip),
-      rack_id_(rack_id),
-      db_(db),
+    std::shared_ptr<const ClusterInfo> clusters_info)
+    : server_info_(server_info),
+      sock_config_(std::move(sock_config)),
       controller_info_(std::move(controller_info)),
       clusters_info_(std::move(clusters_info)),
       fsm_(MIGRATION_NO) {
-  sockfd_ = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-  if (sockfd_ < 0) {
-    throw std::runtime_error("Failed to create raw socket");
-  }
-
-  int buf_size = 2 * 1024 * 1024;
-  setsockopt(sockfd_, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
-
-  int one = 1;
-  if (setsockopt(sockfd_, SOL_PACKET, PACKET_IGNORE_OUTGOING, &one,
-                 sizeof(one)) < 0) {
-    close(sockfd_);
-    throw std::runtime_error("Failed to set socket IP_HDRINCL");
-  }
-
-  server_ip_in_ = inet_addr(server_ip_.c_str());
-  controller_ip_in_ = inet_addr(controller_ip_.c_str());
-
-  index_base_ = rack_id_ * CACHE_SIZE;
+  server_ip_in_ = inet_addr(server_info_.ip.c_str());
+  controller_ip_in_ = inet_addr(controller_info_->ip.c_str());
+  index_base_ = server_info_.rack_id * CACHE_SIZE;
   index_limit_ = index_base_ + CACHE_SIZE;
-
-  struct ifreq ifr;
-  memset(&ifr, 0, sizeof(ifr));
-  snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s",
-           iface_to_controller_.c_str());
-
-  if (ioctl(sockfd_, SIOCGIFINDEX, &ifr) < 0) {
-    close(sockfd_);
-    throw std::runtime_error("Failed to get interface index");
-  }
-
-  ifindex_ = ifr.ifr_ifindex;
-
-  if (ioctl(sockfd_, SIOCGIFHWADDR, &ifr) < 0) {
-    close(sockfd_);
-    throw std::runtime_error("ioctl(SIOCGIFHWADDR) failed");
-  }
-  memcpy(src_mac_, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
 }
 
-ServerInstance::~ServerInstance() {
-  if (running_) Stop();
-}
-
-bool ServerInstance::Start() {
-  try {
-    if (running_) {
-      std::cerr << "[Rack " << rack_id_ << "] Server " << server_ip_
-                << " already running." << std::endl;
-      return false;
-    }
-
-    running_ = true;
-
-    recv_thread_ = std::thread(&ServerInstance::ReceiveThread, this);
-
-    return running_;
-  } catch (const std::exception &e) {
-    std::cerr << "Failed to start server: " << e.what() << std::endl;
-    running_ = false;
-    return running_;
-  } catch (...) {
-    std::cerr << "An unknown error occurred while starting the server."
-              << std::endl;
-    running_ = false;
-    return running_;
-  }
-}
-
-void ServerInstance::Stop() {
-  if (running_) {
-    running_ = false;
-  }
-}
+ServerInstance::~ServerInstance() {}
 
 void ServerInstance::SetKvMigrationRing(
     struct rte_ring *ring, std::shared_ptr<int> kv_migration_event_fd_ptr) {
@@ -162,21 +95,6 @@ void ServerInstance::CacheMigrate(const std::string_view &key,
   }
 }
 
-void ServerInstance::HandleMigrateReply(uint32_t request_id) {
-  std::cout << "[Rack " << rack_id_ << "] Get Migrate Reply\n";
-  bool exist = request_map_.Modify(request_id, [&](auto &req) {
-    try {
-      req->set_value(true);
-    } catch (const std::future_error &e) {
-      std::cerr << "[MIGRATE_REPLY] Future error: " << e.what() << std::endl;
-    }
-  });
-  if (!exist) {
-    std::cerr << "[MIGRATE_REPLY] Request not exist id: " << request_id
-              << std::endl;
-  }
-}
-
 template <typename PayloadType>
 std::vector<uint8_t> ServerInstance::ConstructPacket(
     std::unique_ptr<PayloadType> payload, uint32_t dst_ip, uint32_t src_ip) {
@@ -189,8 +107,8 @@ std::vector<uint8_t> ServerInstance::ConstructPacket(
   std::vector<uint8_t> packet(total_size);
 
   struct ethhdr *eth_hdr = reinterpret_cast<struct ethhdr *>(packet.data());
-  memcpy(eth_hdr->h_dest, controller_mac_.data(), ETH_ALEN);
-  memcpy(eth_hdr->h_source, src_mac_, ETH_ALEN);
+  memcpy(eth_hdr->h_dest, controller_info_->mac.data(), ETH_ALEN);
+  memcpy(eth_hdr->h_source, server_info_.mac.data(), ETH_ALEN);
   eth_hdr->h_proto = htons(ETHERTYPE_IP);
 
   struct iphdr *ip_hdr =
@@ -225,11 +143,11 @@ bool ServerInstance::SendPacket(const std::vector<uint8_t> &packet) {
   socklen_t addrlen = sizeof(dest_addr);
   memset(&dest_addr, 0, addrlen);
   dest_addr.sll_family = AF_PACKET;
-  dest_addr.sll_ifindex = ifindex_;
+  dest_addr.sll_ifindex = sock_config_->ifindex;
   dest_addr.sll_halen = ETH_ALEN;
   memcpy(dest_addr.sll_addr, eth_hdr->h_dest, ETH_ALEN);
 
-  ssize_t bytes_sent = sendto(sockfd_, packet.data(), packet.size(), 0,
+  ssize_t bytes_sent = sendto(sock_config_->sockfd, packet.data(), packet.size(), 0,
                               (struct sockaddr *)&dest_addr, addrlen);
   if (bytes_sent < 0) {
     perror("sendto failed");
@@ -238,60 +156,12 @@ bool ServerInstance::SendPacket(const std::vector<uint8_t> &packet) {
   return true;
 }
 
-void ServerInstance::ReceiveThread() {
-  constexpr int BUFFER_SIZE = 2048;
-  constexpr int MAX_RETRIES = 5;
-
-  struct sockaddr_ll src_addr = {};
-  socklen_t addrlen = sizeof(src_addr);
-  int error_count = 0;
-
-  while (!stop_receive_thread_.load(std::memory_order_relaxed)) {
-    std::vector<uint8_t> buffer(BUFFER_SIZE);
-    ssize_t recvlen =
-        recvfrom(sockfd_, buffer.data(), buffer.size(), MSG_DONTWAIT,
-                 (struct sockaddr *)&src_addr, &addrlen);
-    if (recvlen > 0) {
-      error_count = 0;
-      struct ethhdr *eth_hdr = reinterpret_cast<struct ethhdr *>(buffer.data());
-      if (memcmp(eth_hdr->h_source, src_mac_, ETH_ALEN) == 0) continue;
-      if (ntohs(eth_hdr->h_proto) != ETH_P_IP) continue;
-      if (recvlen < ETH_HLEN + IPV4_HDR_LEN) {
-        std::cerr << "[Recv] Packet too short: " << recvlen << " bytes.\n";
-        continue;
-      }
-      struct iphdr *ip_hdr =
-          reinterpret_cast<struct iphdr *>(buffer.data() + ETH_HLEN);
-      if (ip_hdr->daddr == server_ip_in_) {
-        buffer.resize(recvlen);
-        boost::asio::post(worker_pool_,
-                          [this, packet = std::move(buffer)]() mutable {
-                            ProcessPacket(packet);
-                          });
-      }
-    } else if (recvlen == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-      perror("[Recv] recvfrom error");
-      if (++error_count >= MAX_RETRIES) {
-        std::cerr << "[Recv] Reached max error count, exiting.\n";
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    } else {
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
-  }
-  std::cout << "[Recv] Thread exiting cleanly.\n";
-}
-
-void ServerInstance::ProcessPacket(const std::vector<uint8_t> &packet) {
+void ServerInstance::HandlePacket(const std::vector<uint8_t> &packet) {
   const struct iphdr *ip_hdr =
       reinterpret_cast<const struct iphdr *>(packet.data() + ETH_HLEN);
   switch (ip_hdr->protocol) {
     case IP_PROTOCOLS_MIGRATION_INFO:
       HandleMigrationInfo(packet);
-      break;
-    case IP_PROTOCOLS_ASK:
-      HandleAsk(packet);
       break;
     default:
       std::cerr << "[ProcessPacket] Unknown protocol: "
@@ -371,10 +241,11 @@ inline std::vector<uint8_t> ServerInstance::ConstructMigratePacket(
       reinterpret_cast<struct KVMigrateHeader *>(packet.data() + ETH_HLEN +
                                                  IPV4_HDR_LEN);
   kv_migrate_hdr->request_id = generate_request_id();
-  uint16_t combined = ENCODE_COMBINED(rack_id_, CACHE_MIGRATE, WRITE_REQUEST);
+  uint16_t combined =
+      ENCODE_COMBINED(server_info_.rack_id, CACHE_MIGRATE, WRITE_REQUEST);
   kv_migrate_hdr->combined = htons(combined);
   kv_migrate_hdr->migration_id = migration_id;
-  kv_migrate_hdr->src_rack_id = rack_id_;
+  kv_migrate_hdr->src_rack_id = server_info_.rack_id;
   kv_migrate_hdr->dst_rack_id = dst_rack_id;
   kv_migrate_hdr->cache_index = htons(index);
   kv_migrate_hdr->total_keys = htons(index_size);
@@ -434,38 +305,4 @@ std::vector<uint> ServerInstance::SampleIndices(size_t sample_size) {
   }
 
   return std::vector<uint>(indices.begin(), indices.begin() + sample_size);
-}
-
-void ServerInstance::HandleAsk(const std::vector<uint8_t> &packet) {
-  const struct AskPacket *ask =
-      reinterpret_cast<const struct AskPacket *>(packet.data() + IPV4_HDR_LEN);
-  uint32_t request_id = ask->request_id;
-  bool exist = request_map_.Modify(request_id, [&](auto &req) {
-    try {
-      if (ask->ask == 1) {
-        req->set_value(true);
-      } else {
-        req->set_value(false);
-      }
-    } catch (const std::future_error &e) {
-      std::cerr << "[Ask] Future error: " << e.what() << std::endl;
-    }
-  });
-  if (!exist) {
-    std::cerr << "[Ask] Request not exist id: " << request_id << std::endl;
-  }
-}
-
-bool ServerInstance::SendAsk(uint32_t request_id, uint32_t dst_ip,
-                             uint8_t ask /* = 1 */) {
-  auto payload = std::make_unique<AskPacket>();
-  payload->request_id = request_id;
-  payload->ask = ask;
-
-  auto packet = ConstructPacket(std::move(payload), dst_ip, server_ip_in_);
-  if (!SendPacket(packet)) {
-    std::cerr << "Failed to send AskPacket\n";
-    return false;
-  }
-  return true;
 }

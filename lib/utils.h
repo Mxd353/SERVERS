@@ -60,7 +60,7 @@ static inline void SwapIpv4(struct iphdr *ip_hdr) {
   ip_hdr->daddr = tmp_ip;
 }
 
-inline void parse_mac(const std::string &mac_str,
+inline void ParseMac(const std::string &mac_str,
                       std::array<uint8_t, ETH_ALEN> &mac_bytes) {
   std::istringstream iss(mac_str);
   std::string byte_str;
@@ -70,9 +70,9 @@ inline void parse_mac(const std::string &mac_str,
   }
 }
 
-inline std::array<uint8_t, ETH_ALEN> parse_mac(const std::string &mac_str) {
+inline std::array<uint8_t, ETH_ALEN> ParseMac(const std::string &mac_str) {
   std::array<uint8_t, ETH_ALEN> mac_bytes{};
-  parse_mac(mac_str, mac_bytes);
+  ParseMac(mac_str, mac_bytes);
   return mac_bytes;
 }
 

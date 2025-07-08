@@ -27,8 +27,10 @@ class DPDKHandler {
   DPDKHandler();
   ~DPDKHandler();
 
-  bool Initialize(const std::string& conf, char* program_name,
-                  const std::vector<std::shared_ptr<ServerInstance>>& servers);
+  bool Initialize(
+      const std::string& conf, char* program_name,
+      const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
+          servers);
   void Start();
 
   struct rte_ring* kv_migration_ring;
@@ -63,7 +65,8 @@ class DPDKHandler {
   void SpecialLoop(CoreInfo core_info);
   int PortInit();
   inline void BuildIptoServerMap(
-      const std::vector<std::shared_ptr<ServerInstance>>& servers);
+      const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
+          servers);
 
   inline void LaunchThreads(
       const std::vector<DPDKHandler::CoreInfo>& special_cores_,

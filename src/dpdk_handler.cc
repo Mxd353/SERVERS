@@ -48,18 +48,18 @@ DPDKHandler::~DPDKHandler() {
 }
 
 inline void DPDKHandler::BuildIptoServerMap(
-    const std::vector<std::shared_ptr<ServerInstance>> &servers) {
+    const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>
+        &servers) {
   uint db_size = 0;
   for (const auto &server : servers) {
-    if (!server) {
+    if (!server.second) {
       RTE_LOG(ERR, DB, "Invalid ServerInstance pointer!\n");
       continue;
     }
     std::unique_lock lock(ip_map_mutex_);
-    rte_be32_t be32_ip = server->GetIp();
     auto redis = std::make_shared<sw::redis::Redis>(
-        "tcp://127.0.0.1:6379/" + std::to_string(server->GetDb()));
-    ip_to_server_.emplace(be32_ip, std::make_pair(server, redis));
+        "tcp://127.0.0.1:6379/" + std::to_string(server.second->GetDb()));
+    ip_to_server_.emplace(server.first, std::make_pair(server.second, redis));
     db_size++;
   }
   RTE_LOG(INFO, DB, "Init %d Redis for servers.\n", db_size);
@@ -67,7 +67,8 @@ inline void DPDKHandler::BuildIptoServerMap(
 
 bool DPDKHandler::Initialize(
     const std::string &conf, char *program_name,
-    const std::vector<std::shared_ptr<ServerInstance>> &servers) {
+    const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>
+        &servers) {
   std::vector<std::string> args;
   args.push_back(program_name);
   std::ifstream file(conf);
@@ -102,7 +103,7 @@ bool DPDKHandler::Initialize(
   EventInit();
 
   for (const auto &server : servers) {
-    server->SetKvMigrationRing(kv_migration_ring, kv_migration_event_fd_ptr_);
+    server.second->SetKvMigrationRing(kv_migration_ring, kv_migration_event_fd_ptr_);
   }
 
   nb_ports = rte_eth_dev_count_avail();
@@ -281,8 +282,8 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
           return;
 
         } else if (is_req == MIGRATE_REPLY) {
-          if (auto server = GetServerByIp(dst_addr))
-            server->HandleMigrateReply(kv_header->request_id);
+          // if (auto server = GetServerByIp(dst_addr))
+          //   server->HandleMigrateReply(kv_header->request_id);
         }
       } else if (op == READ_REQUEST) {
         if (auto val = db->get(key)) {

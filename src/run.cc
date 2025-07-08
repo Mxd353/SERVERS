@@ -6,15 +6,16 @@
 
 #include "arp_wrapper.h"
 #include "clusters.h"
+#include "lib/utils.h"
 
 std::atomic<bool> exit_requested(false);
 std::unique_ptr<ServerCluster> clusters;
 
 void signalHandler(int signal) {
   std::cout << "\nReceived shutdown signal: " << signal << std::endl;
-  exit_requested = true;
+  exit_requested.store(true);
   if (clusters) {
-    clusters->StopAll();
+    clusters->Stop();
     std::cout << "All clusters stop" << std::endl;
   }
   std::exit(0);
@@ -45,7 +46,7 @@ void parseClusterInfo(const std::string& server_conf,
     }
     std::string ip_real = "210.45.71.91";
     std::string mac = get_mac_from_python(ip_real);
-    controller_info = {iface, ip, mac};
+    controller_info = {iface, ip, utils::ParseMac(mac)};
 
     std::cout << "RUN: to controller: " << iface << ", mac: " << mac
               << ", ip: " << ip;
@@ -74,6 +75,7 @@ void parseClusterInfo(const std::string& server_conf,
 }
 
 int main(int argc, char* argv[]) {
+  (void)argc;
   std::string server_conf = "conf/server_ips.conf";
   std::string controller_conf = "conf/controller_info.conf";
 
@@ -96,7 +98,7 @@ int main(int argc, char* argv[]) {
 
   std::cout << "RUN: Starting server cluster >>" << std::endl;
   clusters = std::make_unique<ServerCluster>(racks, controller_info);
-  auto servers = clusters->StartAll();
+  auto servers = clusters->GetIpToServerMap();
 
   bool success = dpdk_hander->Initialize(dpdk_conf, progrom_name, servers);
   if (!success) {
@@ -104,9 +106,10 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  clusters->Start(8);
   dpdk_hander->Start();
 
-  while (!exit_requested) {
+  while (!exit_requested.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
