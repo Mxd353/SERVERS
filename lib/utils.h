@@ -1,13 +1,20 @@
 #pragma once
 
-#include <netinet/ip.h>
 #include <linux/if_ether.h>
+#include <netinet/ip.h>
 #include <rte_byteorder.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <climits>
 #include <iostream>
+#include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 
 namespace utils {
 inline void PrintHexData(const void *data, size_t size) {
@@ -61,7 +68,7 @@ static inline void SwapIpv4(struct iphdr *ip_hdr) {
 }
 
 inline void ParseMac(const std::string &mac_str,
-                      std::array<uint8_t, ETH_ALEN> &mac_bytes) {
+                     std::array<uint8_t, ETH_ALEN> &mac_bytes) {
   std::istringstream iss(mac_str);
   std::string byte_str;
   int i = 0;
@@ -74,6 +81,38 @@ inline std::array<uint8_t, ETH_ALEN> ParseMac(const std::string &mac_str) {
   std::array<uint8_t, ETH_ALEN> mac_bytes{};
   ParseMac(mac_str, mac_bytes);
   return mac_bytes;
+}
+
+static inline void exponentialBackoff(int attempt) {
+  int wait_ms = std::min(500 * (1 << (attempt - 1)), 4000);
+  if (attempt == 0) wait_ms = 0;
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+}
+
+static inline uint32_t generate_request_id() {
+  static std::atomic<uint32_t> counter{0};
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  std::uniform_int_distribution<uint32_t> dis(0, UINT32_MAX);
+
+  return htonl(dis(gen) ^ counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+static inline std::vector<uint> SampleIndices(uint base, uint limit,
+                                              size_t sample_size) {
+  std::vector<uint> indices(limit - base);
+  indices.reserve(sample_size);
+  std::iota(indices.begin(), indices.end(), base);
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::shuffle(indices.begin(), indices.end(), gen);
+
+  if (sample_size > indices.size()) {
+    sample_size = indices.size();
+  }
+
+  return std::vector<uint>(indices.begin(), indices.begin() + sample_size);
 }
 
 }  // namespace utils

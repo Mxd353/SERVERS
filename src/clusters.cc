@@ -92,12 +92,33 @@ bool ServerCluster::InitSocket() {
 }
 
 void ServerCluster::StartReceiveThreads(int thread_count) {
+  int total_servers = ip_to_server_.size();
+  int servers_per_thread = (total_servers + thread_count - 1) / thread_count;
+  std::vector<std::shared_ptr<ServerInstance>> all_servers;
+
+  for (const auto &it : ip_to_server_) {
+    all_servers.push_back(it.second);
+  }
+
   for (int i = 0; i < thread_count; ++i) {
-    receive_threads_.emplace_back(&ServerCluster::ReceiveThread, this);
+    int begin = i * servers_per_thread;
+    int end = std::min(begin + servers_per_thread, total_servers);
+
+    receive_threads_.emplace_back(
+        &ServerCluster::ReceiveThread, this,
+        std::vector<std::shared_ptr<ServerInstance>>(
+            all_servers.begin() + begin, all_servers.begin() + end));
   }
 }
 
-void ServerCluster::ReceiveThread() {
+void ServerCluster::ReceiveThread(
+    std::vector<std::shared_ptr<ServerInstance>> servers_subset) {
+  ServerMap local_map;
+
+  for (auto &s : servers_subset) {
+    local_map[s->GetIp()] = s;
+  }
+
   constexpr int BUFFER_SIZE = 2048;
   constexpr int MAX_RETRIES = 5;
 
@@ -121,11 +142,13 @@ void ServerCluster::ReceiveThread() {
       }
       struct iphdr *ip_hdr =
           reinterpret_cast<struct iphdr *>(buffer.data() + ETH_HLEN);
-      if (!IsValidDstIp(ip_hdr->daddr)) {
-        buffer.resize(recvlen);
+
+      auto it = local_map.find(ip_hdr->daddr);
+      if (it != local_map.end()) {
+        auto server = it->second;
         boost::asio::post(worker_pool_,
-                          [this, packet = std::move(buffer)]() mutable {
-                            ProcessPacket(packet);
+                          [server, packet = std::move(buffer)]() mutable {
+                            server->HandlePacket(packet);
                           });
       }
     } else if (recvlen == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -142,15 +165,6 @@ void ServerCluster::ReceiveThread() {
   std::cout << "[Recv] Thread exiting cleanly.\n";
 }
 
-void ServerCluster::ProcessPacket(const std::vector<uint8_t> &packet) {
-  const struct iphdr *ip_hdr =
-      reinterpret_cast<const struct iphdr *>(packet.data() + ETH_HLEN);
-  if (auto server = GetServerByIp(ip_hdr->daddr)) {
-    server->HandlePacket(packet);
-  }
-}
-
-const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>> &
-ServerCluster::GetIpToServerMap() const {
+const ServerCluster::ServerMap &ServerCluster::GetIpToServerMap() const {
   return ip_to_server_;
 }

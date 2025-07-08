@@ -87,9 +87,6 @@ else()
     message(FATAL_ERROR "TBB not found!")
 endif()
 
-find_package(OpenSSL REQUIRED)
-find_package(ZLIB REQUIRED)
-
 if(EXISTS "${HOME_DIR}/lib/dpdk")
     set(DPDK_PATH "${HOME_DIR}/lib/dpdk")
     set(DPDK_LIB_DIR "${DPDK_PATH}/lib/x86_64-linux-gnu")
@@ -182,8 +179,6 @@ target_link_libraries(${TARGET_NAME}
         Boost::system
         TBB::tbb
         Threads::Threads
-        OpenSSL::Crypto
-        ZLIB::ZLIB
         Python3::Python
         ${LIBUV_LIB}
         ${HIREDIS_LIB}

@@ -2,26 +2,14 @@
 
 #include <linux/if_packet.h>
 #include <net/if.h>
-#include <openssl/sha.h>
 #include <pcap.h>
 #include <sw/redis++/errors.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#include <chrono>
 #include <optional>
-#include <thread>
 
 #include "lib/utils.h"
-
-static inline uint32_t generate_request_id() {
-  static std::atomic<uint32_t> counter{0};
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
-  std::uniform_int_distribution<uint32_t> dis(0, UINT32_MAX);
-
-  return htonl(dis(gen) ^ counter.fetch_add(1, std::memory_order_relaxed));
-}
 
 static inline uint16_t Checksum(uint16_t *buffer, int size) {
   unsigned long sum = 0;
@@ -35,13 +23,6 @@ static inline uint16_t Checksum(uint16_t *buffer, int size) {
   sum = (sum >> 16) + (sum & 0xFFFF);
   sum += (sum >> 16);
   return static_cast<uint16_t>(~sum);
-}
-
-static inline void exponentialBackoff(int attempt) {
-  int wait_ms = std::min(500 * (1 << (attempt - 1)), 4000);
-  if (attempt == 0) wait_ms = 0;
-
-  std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
 }
 
 ServerInstance::ServerInstance(
@@ -80,7 +61,7 @@ void ServerInstance::CacheMigrate(const std::string_view &key,
     return;
 
   auto cache_migrate = std::make_unique<struct CacheMigrateHeader>();
-  uint32_t req_id = generate_request_id();
+  uint32_t req_id = utils::generate_request_id();
   cache_migrate->request_id = req_id;
   cache_migrate->migration_id = migration_id;
   std::memset(cache_migrate->key.data(), 0, KEY_LENGTH);
@@ -147,8 +128,9 @@ bool ServerInstance::SendPacket(const std::vector<uint8_t> &packet) {
   dest_addr.sll_halen = ETH_ALEN;
   memcpy(dest_addr.sll_addr, eth_hdr->h_dest, ETH_ALEN);
 
-  ssize_t bytes_sent = sendto(sock_config_->sockfd, packet.data(), packet.size(), 0,
-                              (struct sockaddr *)&dest_addr, addrlen);
+  ssize_t bytes_sent =
+      sendto(sock_config_->sockfd, packet.data(), packet.size(), 0,
+             (struct sockaddr *)&dest_addr, addrlen);
   if (bytes_sent < 0) {
     perror("sendto failed");
     return false;
@@ -240,7 +222,7 @@ inline std::vector<uint8_t> ServerInstance::ConstructMigratePacket(
   struct KVMigrateHeader *kv_migrate_hdr =
       reinterpret_cast<struct KVMigrateHeader *>(packet.data() + ETH_HLEN +
                                                  IPV4_HDR_LEN);
-  kv_migrate_hdr->request_id = generate_request_id();
+  kv_migrate_hdr->request_id = utils::generate_request_id();
   uint16_t combined =
       ENCODE_COMBINED(server_info_.rack_id, CACHE_MIGRATE, WRITE_REQUEST);
   kv_migrate_hdr->combined = htons(combined);
@@ -266,13 +248,8 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
 
   const auto &dst_cluster = (*clusters_info_)[migration_info_hdr->dst_rack_id];
 
-  std::vector<uint> indices;
-
-  indices.reserve(CHUNK_SIZE);
-
-  for (uint i = index_base_; i <= (index_base_ + CHUNK_SIZE); ++i) {
-    indices.push_back(i);
-  }
+  std::vector<uint> indices =
+      utils::SampleIndices(index_base_, index_limit_, CHUNK_SIZE);
 
   auto index_to_ips = HashToIps(indices, dst_cluster);
 
@@ -291,18 +268,4 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
-}
-
-std::vector<uint> ServerInstance::SampleIndices(size_t sample_size) {
-  std::vector<uint> indices(index_limit_ - index_base_);
-  std::iota(indices.begin(), indices.end(), index_base_);
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::shuffle(indices.begin(), indices.end(), gen);
-
-  if (sample_size > indices.size()) {
-    sample_size = indices.size();
-  }
-
-  return std::vector<uint>(indices.begin(), indices.begin() + sample_size);
 }
