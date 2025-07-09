@@ -2,6 +2,8 @@
 
 #include <iostream>
 
+#include "lib/utils.h"
+
 void ServerCluster::InitServers() {
   int db = 0;
   auto shared_clusters =

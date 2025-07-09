@@ -49,7 +49,7 @@ void parseClusterInfo(const std::string& server_conf,
     controller_info = {iface, ip, utils::ParseMac(mac)};
 
     std::cout << "RUN: to controller: " << iface << ", mac: " << mac
-              << ", ip: " << ip;
+              << ", ip: " << ip << "\n";
   }
 
   while (std::getline(server_file, line)) {

@@ -27,19 +27,7 @@ DPDKHandler::DPDKHandler() {}
 
 DPDKHandler::~DPDKHandler() {
   std::cout << "[DPDK] DPDKHandler destructor called\n";
-  if (initialized_) {
-    std::cout << "[DPDK] Cleanup triggered\n";
-    initialized_ = false;
-
-    uint16_t port = 0;
-    rte_eth_dev_stop(port);
-    rte_eth_dev_close(port);
-
-    rte_ring_free(kv_migration_ring);
-
-    rte_eal_cleanup();
-    std::cout << "Bye..." << std::endl;
-  }
+  Stop();
 }
 
 inline void DPDKHandler::BuildIptoServerMap(
@@ -431,4 +419,20 @@ void DPDKHandler::Start() {
   LaunchThreads(special_cores_, normal_cores_);
 
   rte_eal_mp_wait_lcore();
+}
+
+void DPDKHandler::Stop() {
+  if (initialized_) {
+    std::cout << "[DPDK] Cleanup triggered\n";
+    initialized_ = false;
+
+    uint16_t port = 0;
+    rte_eth_dev_stop(port);
+    rte_eth_dev_close(port);
+
+    rte_ring_free(kv_migration_ring);
+
+    rte_eal_cleanup();
+    std::cout << "Bye..." << std::endl;
+  }
 }

@@ -32,7 +32,7 @@ class DPDKHandler {
       const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
           servers);
   void Start();
-
+  void Stop();
   struct rte_ring* kv_migration_ring;
 
  private:
