@@ -23,6 +23,25 @@ const uint32_t custom_packet_len = sizeof(CustomPacket);
 
 std::ofstream outfile("server.output");
 
+inline void redis_test(std::shared_ptr<sw::redis::Redis> redis) {
+  try {
+    std::string reply = redis->ping();
+    if (reply != "PONG") {
+      std::cerr << "[redis_test] Unexpected ping reply: " << reply << std::endl;
+      std::exit(1);
+    }
+  } catch (const sw::redis::ReplyError &e) {
+    std::cerr << "[redis_test] Redis ReplyError: " << e.what() << std::endl;
+    std::exit(1);
+  } catch (const std::exception &e) {
+    std::cerr << "[redis_test] Redis exception: " << e.what() << std::endl;
+    std::exit(1);
+  } catch (...) {
+    std::cerr << "[redis_test] Unknown exception occurred." << std::endl;
+    std::exit(1);
+  }
+}
+
 DPDKHandler::DPDKHandler() {}
 
 DPDKHandler::~DPDKHandler() {
@@ -40,8 +59,11 @@ inline void DPDKHandler::BuildIptoServerMap(
       continue;
     }
     std::unique_lock lock(ip_map_mutex_);
-    auto redis = std::make_shared<sw::redis::Redis>(
-        "tcp://127.0.0.1:6379/" + std::to_string(server.second->GetDb()));
+    int db_index = server.second->GetDb();
+    auto redis = std::make_shared<sw::redis::Redis>("tcp://127.0.0.1:6379/" +
+                                                    std::to_string(db_index));
+
+    redis_test(redis);
     ip_to_server_.emplace(server.first, std::make_pair(server.second, redis));
     db_size++;
   }
@@ -208,6 +230,11 @@ void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
     if (auto db = GetDbByIp(dst_addr)) {
       struct KVHeader *kv_header = (struct KVHeader *)(ip_hdr + 1);
       rte_prefetch0(kv_header);
+
+      // std::cout << utils::ReverseRTE_IPV4(ip_hdr->src_addr) << " -> "
+      //           << utils::ReverseRTE_IPV4(ip_hdr->dst_addr) << "\n";
+
+      // utils::PrintHexData(kv_header, sizeof(struct KVHeader));
 
       uint8_t op = GET_OP(kv_header->combined);
 

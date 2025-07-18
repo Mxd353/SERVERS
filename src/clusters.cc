@@ -31,8 +31,8 @@ void ServerCluster::InitServers() {
       ip_to_server_.emplace(be32_ip, server);
     }
   }
-  std::cout << "Start " << ip_to_server_.size() << " servers from "
-            << clusters_info_.size() << "racks.\n";
+  std::cout << "CLUSTERS: Start " << ip_to_server_.size() << " servers from "
+            << clusters_info_.size() << " racks.\n";
 }
 
 ServerCluster::~ServerCluster() { Stop(); }
@@ -144,6 +144,8 @@ void ServerCluster::ReceiveThread(
       }
       struct iphdr *ip_hdr =
           reinterpret_cast<struct iphdr *>(buffer.data() + ETH_HLEN);
+
+      if (ip_hdr->saddr != inet_addr(controller_info_.ip.c_str())) continue;
 
       auto it = local_map.find(ip_hdr->daddr);
       if (it != local_map.end()) {

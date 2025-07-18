@@ -26,7 +26,7 @@
 #define KEY_LENGTH 16
 #define VALUE_LENGTH 4
 
-constexpr size_t CACHE_SIZE = 256;
+constexpr size_t CACHE_SIZE = 310;
 constexpr size_t CHUNK_SIZE = 128;
 constexpr uint16_t RETRIES = 3;
 

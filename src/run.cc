@@ -48,8 +48,8 @@ void parseClusterInfo(const std::string& server_conf,
     std::string mac = get_mac_from_python(ip_real);
     controller_info = {iface, ip, utils::ParseMac(mac)};
 
-    std::cout << "RUN: to controller: " << iface << ", mac: " << mac
-              << ", ip: " << ip << "\n";
+    std::cout << "RUN: to controller: " << iface << " | mac: " << mac
+              << " | ip: " << ip << "\n";
   }
 
   while (std::getline(server_file, line)) {
@@ -106,7 +106,7 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  clusters->Start(8);
+  clusters->Start(1);
   dpdk_hander->Start();
 
   while (!exit_requested.load()) {

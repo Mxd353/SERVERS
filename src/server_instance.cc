@@ -238,7 +238,7 @@ void ServerInstance::StartMigration(const std::vector<uint8_t> &packet) {
   //   std::cerr << "Migration already in progress or completed.\n";
   //   return;
   // }
-  // std::cout << "[Rack " << rack_id_ << "] Get a StartMigration packet\n";
+  std::cout << "[Rack " << server_info_.rack_id << "] Get a StartMigration packet\n";
 
   const struct MigrationInfo *migration_info_hdr =
       reinterpret_cast<const struct MigrationInfo *>(packet.data() + ETH_HLEN +
