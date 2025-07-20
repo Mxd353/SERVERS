@@ -9,3 +9,4 @@ def get_mac(ip):
     except Exception as e:
         print(f"ARP请求失败: {e}")
         return ""
+
