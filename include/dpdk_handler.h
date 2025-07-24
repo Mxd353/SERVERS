@@ -12,11 +12,12 @@
 #define RTE_LOGTYPE_RING RTE_LOGTYPE_USER1
 #define RTE_LOGTYPE_DB RTE_LOGTYPE_USER2
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
-#define NUM_MBUFS 8191
+#define NUM_MBUFS 262144
 #define MBUF_CACHE_SIZE 512
+#define MBUF_DATA_SIZE 2048
 #define BURST_SIZE 32
-#define RX_RING_SIZE 1024
-#define TX_RING_SIZE 1024
+#define RX_RING_SIZE 8192
+#define TX_RING_SIZE 4096
 
 class DPDKHandler {
   using ServerPair = std::pair<std::shared_ptr<ServerInstance>,
