@@ -17,6 +17,14 @@
 #include <thread>
 
 namespace utils {
+
+inline uint64_t get_now_micros() {
+  using Clock = std::chrono::high_resolution_clock;
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             Clock::now().time_since_epoch())
+      .count();
+}
+
 inline void PrintHexData(const void *data, size_t size) {
   unsigned char *byte_data = (unsigned char *)data;
   for (size_t i = 0; i < size; ++i) {

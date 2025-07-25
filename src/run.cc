@@ -11,13 +11,28 @@
 std::atomic<bool> exit_requested(false);
 std::unique_ptr<ServerCluster> clusters;
 
+extern std::atomic<uint64_t> total_latency_us;
+extern std::atomic<size_t> completed_request_count;
+
 void signalHandler(int signal) {
   std::cout << "\nReceived shutdown signal: " << signal << std::endl;
+
+  uint64_t completed = completed_request_count.load(std::memory_order_relaxed);
+  uint64_t total_latency = total_latency_us.load(std::memory_order_relaxed);
+
   exit_requested.store(true);
   if (clusters) {
     clusters->Stop();
     std::cout << "All clusters stop" << std::endl;
   }
+
+  double latency_us_per_request =
+      completed > 0 ? static_cast<double>(total_latency) / completed : 0.0;
+
+  std::cout << "Total Requests Completed: " << completed << "\n"
+            << "Average Latency per Request (ms/op): "
+            << latency_us_per_request / 1'000.0 << std::endl;
+
   std::exit(0);
 }
 
