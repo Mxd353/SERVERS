@@ -53,8 +53,6 @@ class DPDKHandler {
 
   std::vector<std::unique_ptr<CoreArgs>> core_args_;
 
-  inline void ProcessReceivedPacket(rte_mbuf* mbuf, uint16_t port,
-                                    uint16_t queue_id);
   static inline void SwapMac(rte_ether_hdr* eth_hdr);
   static inline void SwapIpv4(rte_ipv4_hdr* ip_hdr);
   void MainLoop(CoreInfo core_info);
@@ -70,14 +68,14 @@ class DPDKHandler {
   static inline int LaunchNormalLcore(void* arg);
   static inline int LaunchSpeciaLcore(void* arg);
 
-  inline std::shared_ptr<sw::redis::Redis> GetDbByIp(const rte_be32_t& ip) {
-    std::shared_lock lock(ip_map_mutex_);
+  inline std::shared_ptr<sw::redis::Redis> GetDbByIp(
+      const rte_be32_t& ip) const {
     auto it = ip_to_server_.find(ip);
     return it != ip_to_server_.end() ? it->second.second : nullptr;
   };
 
-  inline std::shared_ptr<ServerInstance> GetServerByIp(const rte_be32_t& ip) {
-    std::shared_lock lock(ip_map_mutex_);
+  inline std::shared_ptr<ServerInstance> GetServerByIp(
+      const rte_be32_t& ip) const {
     auto it = ip_to_server_.find(ip);
     return it != ip_to_server_.end() ? it->second.first : nullptr;
   };
