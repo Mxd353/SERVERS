@@ -111,14 +111,14 @@ bool DPDKHandler::Initialize(
   return initialized_;
 }
 
-inline void DPDKHandler::SwapMac(struct rte_ether_hdr *eth_hdr) {
-  struct rte_ether_addr tmp_mac;
+inline void DPDKHandler::SwapMac(rte_ether_hdr *eth_hdr) {
+  rte_ether_addr tmp_mac;
   rte_ether_addr_copy(&eth_hdr->src_addr, &tmp_mac);
   rte_ether_addr_copy(&eth_hdr->dst_addr, &eth_hdr->src_addr);
   rte_ether_addr_copy(&tmp_mac, &eth_hdr->dst_addr);
 }
 
-inline void DPDKHandler::SwapIpv4(struct rte_ipv4_hdr *ip_hdr) {
+inline void DPDKHandler::SwapIpv4(rte_ipv4_hdr *ip_hdr) {
   uint32_t tmp_ip = ip_hdr->src_addr;
   ip_hdr->src_addr = ip_hdr->dst_addr;
   ip_hdr->dst_addr = tmp_ip;
@@ -137,11 +137,11 @@ int DPDKHandler::PortInit() {
     return -1;
   }
 
-  struct rte_eth_conf port_conf;
+  rte_eth_conf port_conf;
   if (!rte_eth_dev_is_valid_port(port)) return -1;
-  memset(&port_conf, 0, sizeof(struct rte_eth_conf));
+  memset(&port_conf, 0, sizeof(rte_eth_conf));
 
-  struct rte_eth_dev_info dev_info;
+  rte_eth_dev_info dev_info;
   retval = rte_eth_dev_info_get(port, &dev_info);
   if (retval != 0) {
     RTE_LOG(ERR, EAL, "Error during getting device (port %u) info: %s\n", port,
@@ -169,7 +169,7 @@ int DPDKHandler::PortInit() {
   retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
   if (retval != 0) return retval;
 
-  struct rte_eth_txconf txconf;
+  rte_eth_txconf txconf;
   txconf = dev_info.default_txconf;
   txconf.offloads = port_conf.txmode.offloads;
 
@@ -205,11 +205,10 @@ int DPDKHandler::PortInit() {
   return 0;
 }
 
-void DPDKHandler::ProcessReceivedPacket(struct rte_mbuf *mbuf, uint16_t port,
-                                        uint16_t queue_id) {
-  uint16_t start_us = utils::get_now_micros();
-  struct rte_ether_hdr *eth_hdr =
-      rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+inline void DPDKHandler::ProcessReceivedPacket(rte_mbuf *mbuf, uint16_t port,
+                                               uint16_t queue_id) {
+  uint64_t start_us = utils::get_now_micros();
+
   rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, rte_ether_hdr *);
   if (unlikely(eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))) {
     return;
@@ -295,7 +294,7 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
 
     RTE_LOG(NOTICE, CORE, "[Normal] %u polling queue: %hu\n", lcore_id,
             queue_id);
-    struct rte_mbuf *bufs[BURST_SIZE];
+    rte_mbuf *bufs[BURST_SIZE];
     while (true) {
       const uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
 
@@ -324,7 +323,7 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
     std::vector<uint8_t> *packet_data = nullptr;
     if (rte_ring_dequeue(kv_migration_ring, (void **)&packet_data) == 0) {
       if (packet_data) {
-        struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
+        rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
         if (!mbuf) {
           std::cerr << "Failed to allocate mbuf" << std::endl;
           delete packet_data;

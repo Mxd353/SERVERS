@@ -12,7 +12,7 @@
 #define RTE_LOGTYPE_RING RTE_LOGTYPE_USER1
 #define RTE_LOGTYPE_DB RTE_LOGTYPE_USER2
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
-#define NUM_MBUFS 262144
+#define NUM_MBUFS 524287
 #define MBUF_CACHE_SIZE 512
 #define MBUF_DATA_SIZE 2048
 #define BURST_SIZE 32
@@ -34,13 +34,13 @@ class DPDKHandler {
           servers);
   void Start();
   void Stop();
-  struct rte_ring* kv_migration_ring;
+  rte_ring* kv_migration_ring;
 
  private:
   volatile bool initialized_ = false;
-  struct rte_mempool* mbuf_pool_;
+  rte_mempool* mbuf_pool_;
   int ret_;
-  struct rte_ether_addr s_eth_addr_;
+  rte_ether_addr s_eth_addr_;
   std::shared_mutex ip_map_mutex_;
   std::unordered_map<rte_be32_t, ServerPair> ip_to_server_;
   std::vector<CoreInfo> special_cores_;
@@ -53,10 +53,10 @@ class DPDKHandler {
 
   std::vector<std::unique_ptr<CoreArgs>> core_args_;
 
-  void ProcessReceivedPacket(struct rte_mbuf* mbuf, uint16_t port,
-                             uint16_t queue_id);
-  static inline void SwapMac(struct rte_ether_hdr* eth_hdr);
-  static inline void SwapIpv4(struct rte_ipv4_hdr* ip_hdr);
+  inline void ProcessReceivedPacket(rte_mbuf* mbuf, uint16_t port,
+                                    uint16_t queue_id);
+  static inline void SwapMac(rte_ether_hdr* eth_hdr);
+  static inline void SwapIpv4(rte_ipv4_hdr* ip_hdr);
   void MainLoop(CoreInfo core_info);
   void SpecialLoop(CoreInfo core_info);
   int PortInit();
