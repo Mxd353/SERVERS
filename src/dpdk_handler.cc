@@ -225,82 +225,90 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
 
     RTE_LOG(NOTICE, CORE, "[Normal] %u polling queue: %hu\n", lcore_id,
             queue_id);
+
     rte_mbuf *bufs[BURST_SIZE];
     while (true) {
       const uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
 
-      if (unlikely(nb_rx <= 0)) continue;
+      if (unlikely(nb_rx <= 0))
+        continue;
+      else {
+        for (uint16_t i = 0; i < nb_rx; i++) {
+          auto &buf = bufs[i];
+          uint64_t start_us = utils::get_now_micros();
 
-      for (uint16_t i = 0; i < nb_rx; i++) {
-        uint64_t start_us = utils::get_now_micros();
+          rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(buf, rte_ether_hdr *);
 
-        rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr *);
-        if (unlikely(eth_hdr->ether_type !=
-                     rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))) {
-          continue;
-        }
-        rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
-        rte_prefetch0(ip_hdr + 1);
-        if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
-          continue;
-        }
+          // if (rte_is_same_ether_addr(&eth_hdr->src_addr, &s_eth_addr_))
+          //   continue;
 
-        SwapMac(eth_hdr);
-
-        rte_be32_t dst_addr = ip_hdr->dst_addr;
-
-        KVHeader *kv_header = (KVHeader *)(ip_hdr + 1);
-        kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
-
-        if (auto db = GetDbByIp(dst_addr)) {
-          uint8_t op = GET_OP(kv_header->combined);
-          uint8_t is_req = GET_IS_REQ(kv_header->combined);
-
-          auto value_ptr = kv_header->value1.data();
-          std::string_view key{kv_header->key.data(), KEY_LENGTH};
-
-          if (op == WRITE_REQUEST) {
-            std::string_view value{value_ptr, VALUE_LENGTH * 4};
-            db->set(key, value);
-
-            if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
-              KVMigrateHeader *kv_migration_header =
-                  (KVMigrateHeader *)(kv_header);
-
-              if (auto server = GetServerByIp(dst_addr))
-                server->CacheMigrate(key, kv_migration_header->migration_id);
-              continue;
-
-            } else if (is_req == MIGRATE_REPLY) {
-              // if (auto server = GetServerByIp(dst_addr))
-              //   server->HandleMigrateReply(kv_header->request_id);
-            }
-          } else if (op == READ_REQUEST) {
-            if (auto val = db->get(key)) {
-              memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
-            } else {
-              RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
-                      DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
-            }
+          if (unlikely(eth_hdr->ether_type !=
+                       rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))) {
+            continue;
           }
-        } else {
-          RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n",
-                  DECODE_IP(dst_addr), rte_lcore_id());
-        }
+          rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
+          rte_prefetch0(ip_hdr + 1);
+          if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
+            continue;
+          }
 
-        ip_hdr->dst_addr = ip_hdr->src_addr;
-        ip_hdr->src_addr = dst_addr;
+          SwapMac(eth_hdr);
 
-        const uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &bufs[i], 1);
-        if (nb_tx < 1) {
-          RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", rte_lcore_id());
-        } else {
-          total_latency_us.fetch_add(utils::get_now_micros() - start_us,
-                                     std::memory_order_relaxed);
-          completed_request_count.fetch_add(1, std::memory_order_relaxed);
+          rte_be32_t dst_addr = ip_hdr->dst_addr;
+
+          KVHeader *kv_header = reinterpret_cast<KVHeader *>(ip_hdr + 1);
+          kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
+
+          // if (auto db = GetDbByIp(dst_addr)) {
+            // uint8_t op = GET_OP(kv_header->combined);
+            // uint8_t is_req = GET_IS_REQ(kv_header->combined);
+
+            // auto value_ptr = kv_header->value1.data();
+            // std::string_view key{kv_header->key.data(), KEY_LENGTH};
+
+            // if (op == WRITE_REQUEST) {
+            //   std::string_view value{value_ptr, VALUE_LENGTH * 4};
+            //   db->set(key, value);
+
+            //   if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
+            //     KVMigrateHeader *kv_migration_header =
+            //         (KVMigrateHeader *)(kv_header);
+
+            //     if (auto server = GetServerByIp(dst_addr))
+            //       server->CacheMigrate(key, kv_migration_header->migration_id);
+            //     continue;
+
+            //   } else if (is_req == MIGRATE_REPLY) {
+            //     // if (auto server = GetServerByIp(dst_addr))
+            //     //   server->HandleMigrateReply(kv_header->request_id);
+            //   }
+            // } else if (op == READ_REQUEST) {
+            //   if (auto val = db->get(key)) {
+            //     memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
+            //   } else {
+            //     RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
+            //             DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
+            //   }
+            // }
+          // } else {
+          //   RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n ",
+          //           DECODE_IP(dst_addr), rte_lcore_id());
+          // }
+
+          ip_hdr->dst_addr = ip_hdr->src_addr;
+          ip_hdr->src_addr = dst_addr;
+
+          const uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &buf, 1);
+          if (nb_tx < 1) {
+            RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", rte_lcore_id());
+          } else {
+            total_latency_us.fetch_add(utils::get_now_micros() - start_us,
+                                       std::memory_order_relaxed);
+            completed_request_count.fetch_add(1, std::memory_order_relaxed);
+          }
         }
+        rte_pktmbuf_free_bulk(bufs, nb_rx);
       }
-      rte_pktmbuf_free_bulk(bufs, nb_rx);
     }
   } else {
     printf("Skip main lcore %u\n", lcore_id);

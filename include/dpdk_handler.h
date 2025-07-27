@@ -68,14 +68,14 @@ class DPDKHandler {
   static inline int LaunchNormalLcore(void* arg);
   static inline int LaunchSpeciaLcore(void* arg);
 
-  inline std::shared_ptr<sw::redis::Redis> GetDbByIp(
-      const rte_be32_t& ip) const {
+  inline std::shared_ptr<sw::redis::Redis> GetDbByIp(const rte_be32_t& ip) {
+    std::shared_lock lock(ip_map_mutex_);
     auto it = ip_to_server_.find(ip);
     return it != ip_to_server_.end() ? it->second.second : nullptr;
   };
 
-  inline std::shared_ptr<ServerInstance> GetServerByIp(
-      const rte_be32_t& ip) const {
+  inline std::shared_ptr<ServerInstance> GetServerByIp(const rte_be32_t& ip) {
+    std::shared_lock lock(ip_map_mutex_);
     auto it = ip_to_server_.find(ip);
     return it != ip_to_server_.end() ? it->second.first : nullptr;
   };
