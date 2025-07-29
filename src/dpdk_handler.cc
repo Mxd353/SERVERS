@@ -59,7 +59,8 @@ inline void DPDKHandler::BuildIptoServerMap(
                                                     std::to_string(db_index));
 
     redis_test(redis);
-    ip_to_server_.emplace(server.first, std::make_pair(server.second, redis));
+    ip_to_server_.emplace(server.first, server.second);
+    ip_to_db_.emplace(server.first, redis);
     db_size++;
   }
   RTE_LOG(INFO, DB, "Init %d Redis for servers.\n", db_size);
@@ -130,9 +131,16 @@ int DPDKHandler::PortInit() {
   uint16_t nb_txd = TX_RING_SIZE;
   int retval;
 
-  if (mbuf_pool_ == NULL) {
+  if (tx_mbufpool_ == NULL) {
     RTE_LOG(ERR, EAL,
-            "mbuf_pool is NULL, please create a mempool before calling "
+            "tx_mbufpool_ is NULL, please create a mempool before calling "
+            "PortInit.\n");
+    return -1;
+  }
+
+  if (rx_mbufpool_ == NULL) {
+    RTE_LOG(ERR, EAL,
+            "rx_mbufpool_ is NULL, please create a mempool before calling "
             "PortInit.\n");
     return -1;
   }
@@ -175,8 +183,9 @@ int DPDKHandler::PortInit() {
 
   uint16_t queue_id = 0;
   for (uint i = 0; i < nb_normal_cores; i++) {
-    retval = rte_eth_rx_queue_setup(
-        port, queue_id, nb_rxd, rte_eth_dev_socket_id(port), NULL, mbuf_pool_);
+    retval =
+        rte_eth_rx_queue_setup(port, queue_id, nb_rxd,
+                               rte_eth_dev_socket_id(port), NULL, rx_mbufpool_);
     if (retval < 0) return retval;
 
     retval = rte_eth_tx_queue_setup(port, queue_id, nb_txd,
@@ -196,11 +205,20 @@ int DPDKHandler::PortInit() {
   retval = rte_eth_dev_start(port);
   if (retval < 0) return retval;
 
+  struct rte_ether_addr bbdev_port_eth_addr;
+  retval = rte_eth_macaddr_get(port, &bbdev_port_eth_addr);
+  if (retval < 0) {
+    printf("rte_eth_macaddr_get: err=%d\n", retval);
+    return -1;
+  }
+  RTE_LOG(INFO, EAL, "Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n",
+          (unsigned)port, RTE_ETHER_ADDR_BYTES(&bbdev_port_eth_addr));
+
   RTE_LOG(INFO, EAL, "Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n",
           (unsigned)port, RTE_ETHER_ADDR_BYTES(&s_eth_addr_));
 
-  retval = rte_eth_promiscuous_enable(port);
-  if (retval != 0) return retval;
+  // retval = rte_eth_promiscuous_enable(port);
+  // if (retval != 0) return retval;
 
   return 0;
 }
@@ -228,19 +246,17 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
 
     rte_mbuf *bufs[BURST_SIZE];
     while (true) {
-      const uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
+      uint16_t nb_rx = 0;
+      nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
 
       if (unlikely(nb_rx <= 0))
         continue;
       else {
+        uint64_t start_us = utils::get_now_micros();
         for (uint16_t i = 0; i < nb_rx; i++) {
-          auto &buf = bufs[i];
-          uint64_t start_us = utils::get_now_micros();
-
-          rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(buf, rte_ether_hdr *);
-
-          // if (rte_is_same_ether_addr(&eth_hdr->src_addr, &s_eth_addr_))
-          //   continue;
+          auto buf = bufs[i];
+          struct rte_mbuf *resp_buf = rte_pktmbuf_clone(buf, tx_mbufpool_);
+          rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(resp_buf, rte_ether_hdr *);
 
           if (unlikely(eth_hdr->ether_type !=
                        rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))) {
@@ -257,57 +273,73 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
           rte_be32_t dst_addr = ip_hdr->dst_addr;
 
           KVHeader *kv_header = reinterpret_cast<KVHeader *>(ip_hdr + 1);
+
+          if (auto db = GetDbByIp(dst_addr)) {
+            uint8_t op = GET_OP(kv_header->combined);
+            uint8_t is_req = GET_IS_REQ(kv_header->combined);
+
+            auto value_ptr = kv_header->value1.data();
+            std::string_view key{kv_header->key.data(), KEY_LENGTH};
+
+            if (op == WRITE_REQUEST) {
+              std::string_view value{value_ptr, VALUE_LENGTH * 4};
+              db->set(key, value);
+
+              if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
+                KVMigrateHeader *kv_migration_header =
+                    (KVMigrateHeader *)(kv_header);
+
+                if (auto server = GetServerByIp(dst_addr))
+                  server->CacheMigrate(key,
+                  kv_migration_header->migration_id);
+                continue;
+
+              } else if (is_req == MIGRATE_REPLY) {
+                // if (auto server = GetServerByIp(dst_addr))
+                //   server->HandleMigrateReply(kv_header->request_id);
+              }
+            } else if (op == READ_REQUEST) {
+              if (auto val = db->get(key)) {
+                rte_memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
+              } else {
+                RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
+                        DECODE_IP(dst_addr), KEY_LENGTH,
+                        kv_header->key.data());
+              }
+            }
+          } else {
+            utils::PrintHexData(kv_header, C_M_HDR_LEN);
+            RTE_LOG(WARNING, DB,
+                    "[%d.%d.%d.%d] Not find db on lcore: %u, nb_rx: %d\n ",
+                    DECODE_IP(dst_addr), rte_lcore_id(), nb_rx);
+          }
+
           kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
-
-          // if (auto db = GetDbByIp(dst_addr)) {
-            // uint8_t op = GET_OP(kv_header->combined);
-            // uint8_t is_req = GET_IS_REQ(kv_header->combined);
-
-            // auto value_ptr = kv_header->value1.data();
-            // std::string_view key{kv_header->key.data(), KEY_LENGTH};
-
-            // if (op == WRITE_REQUEST) {
-            //   std::string_view value{value_ptr, VALUE_LENGTH * 4};
-            //   db->set(key, value);
-
-            //   if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
-            //     KVMigrateHeader *kv_migration_header =
-            //         (KVMigrateHeader *)(kv_header);
-
-            //     if (auto server = GetServerByIp(dst_addr))
-            //       server->CacheMigrate(key, kv_migration_header->migration_id);
-            //     continue;
-
-            //   } else if (is_req == MIGRATE_REPLY) {
-            //     // if (auto server = GetServerByIp(dst_addr))
-            //     //   server->HandleMigrateReply(kv_header->request_id);
-            //   }
-            // } else if (op == READ_REQUEST) {
-            //   if (auto val = db->get(key)) {
-            //     memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
-            //   } else {
-            //     RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
-            //             DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
-            //   }
-            // }
-          // } else {
-          //   RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find db on lcore: %u\n ",
-          //           DECODE_IP(dst_addr), rte_lcore_id());
-          // }
 
           ip_hdr->dst_addr = ip_hdr->src_addr;
           ip_hdr->src_addr = dst_addr;
 
-          const uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &buf, 1);
-          if (nb_tx < 1) {
+          uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &resp_buf, 1);
+          if (unlikely(nb_tx != 1))
             RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", rte_lcore_id());
-          } else {
-            total_latency_us.fetch_add(utils::get_now_micros() - start_us,
-                                       std::memory_order_relaxed);
-            completed_request_count.fetch_add(1, std::memory_order_relaxed);
-          }
         }
         rte_pktmbuf_free_bulk(bufs, nb_rx);
+        total_latency_us.fetch_add(utils::get_now_micros() - start_us,
+                                   std::memory_order_relaxed);
+        completed_request_count.fetch_add(nb_rx, std::memory_order_relaxed);
+
+        // // 检查内存池可用性
+        // unsigned avail = rte_mempool_avail_count(rx_mbufpool_);
+        // unsigned in_use = rte_mempool_in_use_count(rx_mbufpool_);
+
+        // RTE_LOG(INFO, MEMPOOL, "RX_Mempool: avail=%u, in_use=%u\n", avail,
+        //         in_use);
+
+        // avail = rte_mempool_avail_count(tx_mbufpool_);
+        // in_use = rte_mempool_in_use_count(tx_mbufpool_);
+
+        // RTE_LOG(INFO, MEMPOOL, "TX_Mempool: avail=%u, in_use=%u\n", avail,
+        //         in_use);
       }
     }
   } else {
@@ -326,14 +358,14 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
     std::vector<uint8_t> *packet_data = nullptr;
     if (rte_ring_dequeue(kv_migration_ring, (void **)&packet_data) == 0) {
       if (packet_data) {
-        rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
+        rte_mbuf *mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
         if (!mbuf) {
           std::cerr << "Failed to allocate mbuf" << std::endl;
           delete packet_data;
           continue;
         }
         char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
-        memcpy(mbuf_data, packet_data->data(), packet_data->size());
+        rte_memcpy(mbuf_data, packet_data->data(), packet_data->size());
 
         rte_pktmbuf_data_len(mbuf) = packet_data->size();
         rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf);
@@ -408,10 +440,15 @@ void DPDKHandler::Start() {
   uint16_t port = 0;
   uint nb_ports = rte_eth_dev_count_avail();
 
-  mbuf_pool_ = rte_pktmbuf_pool_create(
-      "MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
-      RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-  if (mbuf_pool_ == NULL) rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+  tx_mbufpool_ = rte_pktmbuf_pool_create(
+      "TX_MBUF_POOL", TX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
+      TX_MBUF_DATA_SIZE, rte_socket_id());
+  if (tx_mbufpool_ == NULL) rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+
+  rx_mbufpool_ = rte_pktmbuf_pool_create(
+      "RX_MBUF_POOL", RX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
+      RX_MBUF_DATA_SIZE, rte_socket_id());
+  if (rx_mbufpool_ == NULL) rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
 
   uint count = 0;
   uint lcore_id;

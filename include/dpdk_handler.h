@@ -12,16 +12,16 @@
 #define RTE_LOGTYPE_RING RTE_LOGTYPE_USER1
 #define RTE_LOGTYPE_DB RTE_LOGTYPE_USER2
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
-#define NUM_MBUFS 524287
+#define TX_NUM_MBUFS 1'048'575
+#define RX_NUM_MBUFS 1'048'575
 #define MBUF_CACHE_SIZE 512
-#define MBUF_DATA_SIZE 2048
+#define TX_MBUF_DATA_SIZE 256
+#define RX_MBUF_DATA_SIZE 2048
 #define BURST_SIZE 32
 #define RX_RING_SIZE 8192
 #define TX_RING_SIZE 4096
 
 class DPDKHandler {
-  using ServerPair = std::pair<std::shared_ptr<ServerInstance>,
-                               std::shared_ptr<sw::redis::Redis>>;
   using CoreInfo = std::pair<uint, uint16_t>;
 
  public:
@@ -38,11 +38,13 @@ class DPDKHandler {
 
  private:
   volatile bool initialized_ = false;
-  rte_mempool* mbuf_pool_;
+  rte_mempool* tx_mbufpool_;
+  rte_mempool* rx_mbufpool_;
   int ret_;
   rte_ether_addr s_eth_addr_;
   std::shared_mutex ip_map_mutex_;
-  std::unordered_map<rte_be32_t, ServerPair> ip_to_server_;
+  std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>> ip_to_server_;
+  std::unordered_map<rte_be32_t, std::shared_ptr<sw::redis::Redis>> ip_to_db_;
   std::vector<CoreInfo> special_cores_;
   std::vector<CoreInfo> normal_cores_;
 
@@ -69,14 +71,12 @@ class DPDKHandler {
   static inline int LaunchSpeciaLcore(void* arg);
 
   inline std::shared_ptr<sw::redis::Redis> GetDbByIp(const rte_be32_t& ip) {
-    std::shared_lock lock(ip_map_mutex_);
-    auto it = ip_to_server_.find(ip);
-    return it != ip_to_server_.end() ? it->second.second : nullptr;
+    auto it = ip_to_db_.find(ip);
+    return it != ip_to_db_.end() ? it->second : nullptr;
   };
 
   inline std::shared_ptr<ServerInstance> GetServerByIp(const rte_be32_t& ip) {
-    std::shared_lock lock(ip_map_mutex_);
     auto it = ip_to_server_.find(ip);
-    return it != ip_to_server_.end() ? it->second.first : nullptr;
+    return it != ip_to_server_.end() ? it->second : nullptr;
   };
 };
