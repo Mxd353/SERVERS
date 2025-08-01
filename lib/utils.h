@@ -18,6 +18,15 @@
 
 namespace utils {
 
+inline void monitor_mempool(struct rte_mempool *mp) {
+  unsigned avail = rte_mempool_avail_count(mp);
+  unsigned in_use = rte_mempool_in_use_count(mp);
+  double use_percent = (double)in_use * 100.0 / (double)mp->size;
+
+  RTE_LOG(NOTICE, MEMPOOL, "Status: Available=%u, In_use=%u (%.1f%%)\n", avail,
+          in_use, use_percent);
+}
+
 inline uint64_t get_now_micros() {
   using Clock = std::chrono::high_resolution_clock;
   return std::chrono::duration_cast<std::chrono::microseconds>(
