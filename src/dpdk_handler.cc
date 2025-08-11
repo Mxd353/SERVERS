@@ -8,9 +8,11 @@
 #include <rte_per_lcore.h>
 #include <unistd.h>
 
+#include <boost/redis/src.hpp>
 #include <fstream>
 #include <iostream>
 
+#include "lib/sync_connection.hpp"
 #include "lib/utils.h"
 
 std::atomic<uint64_t> total_latency_us{0};
@@ -20,16 +22,20 @@ std::ofstream outfile("server.output");
 
 #include <rte_mempool.h>
 
-inline void redis_test(std::shared_ptr<sw::redis::Redis> redis) {
+inline void redis_test(boost::redis::sync_connection &conn) {
   try {
-    std::string reply = redis->ping();
+    boost::redis::request req;
+    boost::redis::response<std::string> resp;
+
+    req.push("PING");
+
+    conn.exec(req, resp);
+
+    auto reply = std::get<0>(resp).value();
     if (reply != "PONG") {
       std::cerr << "[redis_test] Unexpected ping reply: " << reply << std::endl;
       std::exit(1);
     }
-  } catch (const sw::redis::ReplyError &e) {
-    std::cerr << "[redis_test] Redis ReplyError: " << e.what() << std::endl;
-    std::exit(1);
   } catch (const std::exception &e) {
     std::cerr << "[redis_test] Redis exception: " << e.what() << std::endl;
     std::exit(1);
@@ -60,26 +66,6 @@ inline void DPDKHandler::BuildIptoServerMap(
     db_size++;
   }
   RTE_LOG(INFO, DB, "Init %d Redis for servers.\n", db_size);
-}
-
-inline void DPDKHandler::BuildIptoDBMap(
-    std::unordered_map<rte_be32_t, std::shared_ptr<sw::redis::Redis>>
-        &ip_to_db) {
-  uint db_size = 0;
-  for (const auto &server : ip_to_server_) {
-    if (!server.second) {
-      RTE_LOG(ERR, DB, "Invalid ServerInstance pointer!\n");
-      continue;
-    }
-    int db_index = server.second->GetDb();
-    auto redis = std::make_shared<sw::redis::Redis>(
-        "tcp://127.0.0.1:6379/" + std::to_string(db_index) +
-        "?keep_alive=true&socket_timeout=50ms&connect_timeout=1s");
-
-    redis_test(redis);
-    ip_to_db.emplace(server.first, redis);
-    db_size++;
-  }
 }
 
 bool DPDKHandler::Initialize(
@@ -157,7 +143,7 @@ int DPDKHandler::PortInit() {
   tmp_rxmode.mtu = TX_MBUF_DATA_SIZE;
 
   rte_eth_rss_conf rss_conf;
-  rss_conf.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP;
+  rss_conf.rss_hf = RTE_ETH_RSS_IP;
 
   port_conf_default.rxmode = tmp_rxmode;
   port_conf_default.rx_adv_conf.rss_conf = rss_conf;
@@ -248,15 +234,49 @@ int DPDKHandler::PortInit() {
   return 0;
 }
 
+inline void BuildIptoDBMapFlat(
+    std::shared_ptr<boost::redis::sync_connection> ip_to_db_flat[]) {
+  int base_port = 6380;
+  for (int subnet = 0; subnet < SUBNET_COUNT; ++subnet) {
+    for (int host = 1; host <= HOST_PER_SUBNET; ++host) {
+      int index = subnet * HOST_PER_SUBNET + (host - 1);
+
+      boost::redis::config cfg;
+      cfg.addr.host = "127.0.0.1";
+      cfg.addr.port = index + base_port;
+      auto conn = std::make_shared<boost::redis::sync_connection>();
+      conn->run(cfg);
+
+      redis_test(*conn);
+      ip_to_db_flat[index] = conn;
+    }
+  }
+}
+
+inline int LookupRedis(rte_be32_t ip_be) {
+  uint32_t ip = rte_be_to_cpu_32(ip_be);
+
+  uint8_t subnet = (ip >> 8) & 0xFF;
+  uint8_t host = ip & 0xFF;
+
+  if (subnet < SUBNET_BASE || subnet >= SUBNET_BASE + SUBNET_COUNT) return 0;
+  if (host == 0 || host > HOST_PER_SUBNET) return 0;
+
+  return (subnet - SUBNET_BASE) * HOST_PER_SUBNET + (host - 1);
+}
+
 void DPDKHandler::MainLoop(CoreInfo core_info) {
-  uint16_t port = 0;
+  thread_local uint16_t port = 0;
 
-  uint lcore_id = core_info.first;
-  uint16_t queue_id = core_info.second;
+  thread_local uint lcore_id = core_info.first;
+  thread_local uint16_t queue_id = core_info.second;
 
-  std::unordered_map<rte_be32_t, std::shared_ptr<sw::redis::Redis>> ip_to_db;
+  thread_local std::shared_ptr<boost::redis::sync_connection>
+      ip_to_db_flat[SUBNET_COUNT * HOST_PER_SUBNET];
+  BuildIptoDBMapFlat(ip_to_db_flat);
 
-  BuildIptoDBMap(ip_to_db);
+  static thread_local boost::redis::request req;
+  static thread_local boost::redis::response<std::optional<std::string>> resp;
 
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
     rte_exit(EXIT_FAILURE, "Invalid lcore_id=%u\n", lcore_id);
@@ -279,17 +299,24 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
       nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
 
       if (unlikely(nb_rx <= 0)) {
-        rte_delay_us(10);
+        rte_pause();
         continue;
       } else {
         for (uint16_t i = 0; i < nb_rx; i++) {
-          // uint64_t start_us = utils::get_now_micros();
+          // struct rte_mbuf *resp_buf = rte_pktmbuf_clone(bufs[i],
+          // tx_mbufpool_);
+          if (i + 1 < nb_rx)
+            rte_prefetch0(rte_pktmbuf_mtod(bufs[i + 1], void *));
 
-          struct rte_mbuf *resp_buf = rte_pktmbuf_clone(bufs[i], tx_mbufpool_);
-          rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(resp_buf, rte_ether_hdr *);
+          rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr *);
 
           rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
           rte_prefetch0(ip_hdr + 1);
+
+          if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
+            rte_pktmbuf_free(bufs[i]);
+            continue;
+          }
 
           SwapMac(eth_hdr);
 
@@ -299,54 +326,52 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
           ip_hdr->src_addr = dst_addr;
 
           KVHeader *kv_header = reinterpret_cast<KVHeader *>(ip_hdr + 1);
-          // std::cout << completed_request_count << std::endl;
           kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
 
-          auto it = ip_to_db.find(dst_addr);
-          if (it != ip_to_db.end()) {
-            uint8_t op = GET_OP(kv_header->combined);
-            uint8_t is_req = GET_IS_REQ(kv_header->combined);
+          auto &db = ip_to_db_flat[LookupRedis(dst_addr)];
 
-            auto value_ptr = kv_header->value1.data();
-            std::string_view key{kv_header->key.data(), KEY_LENGTH};
+          uint8_t op = GET_OP(kv_header->combined);
+          uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
-            if (op == WRITE_REQUEST) {
-              std::string_view value{value_ptr, VALUE_LENGTH * 4};
-              it->second->set(key, value);
+          auto value_ptr = kv_header->value1.data();
+          std::string_view key{kv_header->key.data(), KEY_LENGTH};
+          req.clear();
+          if (op == WRITE_REQUEST) {
+            std::string_view value{value_ptr, VALUE_LENGTH * 4};
+            req.push("SET", key, value);
+            db->exec(req, boost::redis::ignore);
 
-              if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
+            if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
+              if (auto server = GetServerByIp(dst_addr)) {
                 KVMigrateHeader *kv_migration_header =
                     (KVMigrateHeader *)(kv_header);
-
-                if (auto server = GetServerByIp(dst_addr))
-                  server->CacheMigrate(key, kv_migration_header->migration_id);
-                rte_pktmbuf_free(bufs[i]);
-                continue;
-
-              } else if (is_req == MIGRATE_REPLY) {
-                // if (auto server = GetServerByIp(dst_addr))
-                //   server->HandleMigrateReply(kv_header->request_id);
+                server->CacheMigrate(key, kv_migration_header->migration_id);
               }
-            } else {
-              if (auto val = it->second->get(key)) {
-                rte_memcpy(value_ptr, val->data(), VALUE_LENGTH * 4);
-              } else {
-                RTE_LOG(WARNING, DB, "[%d.%d.%d.%d] Not find key: %.*s\n",
-                        DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data());
-              }
+              rte_pktmbuf_free(bufs[i]);
+              continue;
             }
           } else {
-            RTE_LOG(WARNING, DB,
-                    "[%d.%d.%d.%d] Not find db on lcore: %u, nb_rx: %d\n ",
-                    DECODE_IP(dst_addr), rte_lcore_id(), nb_rx);
+            req.push("GET", key);
+            resp = {};
+            db->exec(req, resp);
+
+            auto &val = std::get<0>(resp).value();
+            if (val) {
+              rte_memcpy(value_ptr, val.value().data(), VALUE_LENGTH * 4);
+            } else {
+              RTE_LOG(WARNING, DB,
+                      "[%d.%d.%d.%d] Not find key: %.*s in core: %u\n",
+                      DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data(),
+                      lcore_id);
+            }
           }
 
-          uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &resp_buf, 1);
-          if (unlikely(nb_tx != 1))
-            RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", rte_lcore_id());
-          rte_pktmbuf_free(resp_buf);
+          uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &bufs[i], 1);
+          if (unlikely(nb_tx < 1)) {
+            RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", lcore_id);
+            rte_pktmbuf_free(bufs[i]);
+          }
         }
-        rte_pktmbuf_free_bulk(bufs, nb_rx);
       }
     }
   } else {
@@ -386,7 +411,7 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
         }
       }
     } else {
-      rte_pause();
+      rte_delay_us_sleep(10);
     }
   }
 }
@@ -399,7 +424,8 @@ inline int DPDKHandler::LaunchNormalLcore(void *arg) {
 
 inline int DPDKHandler::LaunchSpeciaLcore(void *arg) {
   CoreArgs *args = static_cast<CoreArgs *>(arg);
-  args->instance->SpecialLoop(args->core_info);
+  (void)args;
+  // args->instance->SpecialLoop(args->core_info);
   return 0;
 }
 
@@ -482,7 +508,7 @@ void DPDKHandler::Start() {
     for (size_t i = 0; i < normal_cores_.size(); ++i)
       std::cout << rte_eth_rx_queue_count(port, i) << " | ";
     std::cout << std::endl;
-    rte_delay_ms(1000);
+    rte_delay_us_sleep(1000'000);
   }
   rte_eal_mp_wait_lcore();
 }

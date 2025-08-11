@@ -12,15 +12,19 @@
 #define RTE_LOGTYPE_RING RTE_LOGTYPE_USER1
 #define RTE_LOGTYPE_DB RTE_LOGTYPE_USER2
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
-#define TX_NUM_MBUFS 65'536
-#define RX_NUM_MBUFS 131'071
-#define MBUF_CACHE_SIZE 512
+#define TX_NUM_MBUFS 16'383
+#define RX_NUM_MBUFS 32'767
+#define MBUF_CACHE_SIZE 256
 #define TX_MBUF_DATA_SIZE 256
 #define RX_MBUF_DATA_SIZE 512
-#define BURST_SIZE 128
-#define RX_RING_SIZE 8192
-#define TX_RING_SIZE 4096
+#define BURST_SIZE 32
+#define RX_RING_SIZE 2048
+#define TX_RING_SIZE 1024
 #define SAFETY_FACTOR 1.5
+
+constexpr int SUBNET_BASE = 7;
+constexpr int SUBNET_COUNT = 32;
+constexpr int HOST_PER_SUBNET = 32;
 
 class DPDKHandler {
   using CoreInfo = std::pair<uint, uint16_t>;
@@ -63,9 +67,6 @@ class DPDKHandler {
   inline void BuildIptoServerMap(
       const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
           servers);
-  inline void BuildIptoDBMap(
-      std::unordered_map<rte_be32_t, std::shared_ptr<sw::redis::Redis>>&
-          ip_to_db);
   inline void LaunchThreads(
       const std::vector<DPDKHandler::CoreInfo>& special_cores_,
       const std::vector<DPDKHandler::CoreInfo>& normal_cores_);

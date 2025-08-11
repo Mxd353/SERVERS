@@ -6,6 +6,12 @@ project(ClusterRun
     LANGUAGES CXX
 )
 
+# set(CMAKE_BUILD_TYPE Release)
+
+# option(USE_FEATURE_X "Enable feature X" OFF)
+
+set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+
 add_subdirectory(lib/arp)
 
 set(HOME_DIR $ENV{HOME})
@@ -23,6 +29,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 message(STATUS "Using C++ standard: ${CMAKE_CXX_STANDARD}")
 
 add_definitions(-DRTE_USE_C11_MEM_MODEL)
+
+# add_compile_options(-O3 -march=native -funroll-loops -fomit-frame-pointer)
 
 add_compile_options(
     -g
@@ -76,6 +84,8 @@ else()
     message(FATAL_ERROR "Boost not found!")
 endif()
 
+find_package(OpenSSL REQUIRED)
+
 if(EXISTS "${HOME_DIR}/lib/tbb")
     set(CMAKE_PREFIX_PATH "${HOME_DIR}/lib/tbb" ${CMAKE_PREFIX_PATH})
 endif()
@@ -104,60 +114,6 @@ else()
     message(FATAL_ERROR "DPDK not found. Make sure pkg-config can find libdpdk.pc.")
 endif()
 
-if(EXISTS "${HOME_DIR}/lib/libuv")
-    set(LIBUV_PATH ${HOME_DIR}/lib/libuv)
-    message(STATUS "LIBUV_PATH: ${LIBUV_PATH}")
-
-    find_library(LIBUV_LIB NAMES uv uv1 libuv
-        PATHS ${LIBUV_PATH}/lib
-        NO_DEFAULT_PATH
-    )
-    find_path(LIBUV_INCLUDE_DIR uv.h
-        PATHS ${LIBUV_PATH}/include
-        NO_DEFAULT_PATH
-    )
-else()
-    message(STATUS "Using system libuv library")
-
-    find_library(LIBUV_LIB NAMES uv uv1 libuv)
-    find_path(LIBUV_INCLUDE_DIR uv.h)
-
-    if(NOT LIBUV_LIB OR NOT LIBUV_INCLUDE_DIR)
-        message(FATAL_ERROR "Could not find system libuv. Please install libuv or set LIBUV_PATH.")
-    endif()
-endif()
-
-message(STATUS "Using LIBUV include dir: ${LIBUV_INCLUDE_DIR}")
-message(STATUS "Using libuv library: ${LIBUV_LIB}")
-
-find_path(HIREDIS_HEADER hiredis)
-find_library(HIREDIS_LIB hiredis)
-if(NOT HIREDIS_LIB)
-    message(FATAL_ERROR "Could not find hiredis library")
-else()
-    message(STATUS "Found hiredis lib: ${HIREDIS_LIB}")
-endif()
-
-
-if(EXISTS "${HOME_DIR}/lib/redis++")
-    set(REDIS_PLUS_PLUS_PATH ${HOME_DIR}/lib/redis++)
-    find_path(REDIS_PLUS_PLUS_HEADER sw
-        PATHS ${REDIS_PLUS_PLUS_PATH}/include
-        NO_DEFAULT_PATH
-    )
-    find_library(REDIS_PLUS_PLUS_LIB redis++ PATHS ${REDIS_PLUS_PLUS_PATH}/lib NO_DEFAULT_PATH)
-else()
-    find_path(REDIS_PLUS_PLUS_HEADER sw)
-    find_library(REDIS_PLUS_PLUS_LIB redis++)
-endif()
-
-if(NOT REDIS_PLUS_PLUS_HEADER OR NOT REDIS_PLUS_PLUS_LIB)
-    message(FATAL_ERROR "Could not find Redis++ library or headers")
-else()
-    message(STATUS "Using redis++ include dir: ${REDIS_PLUS_PLUS_HEADER}")
-    message(STATUS "Using redis++ lib: ${REDIS_PLUS_PLUS_LIB}")
-endif()
-
 target_include_directories(${TARGET_NAME}
     PUBLIC
         ${Boost_INCLUDE_DIRS}
@@ -176,13 +132,12 @@ target_link_directories(${TARGET_NAME}
 
 target_link_libraries(${TARGET_NAME}
     PUBLIC
+        OpenSSL::SSL
+        OpenSSL::Crypto
         Boost::system
         TBB::tbb
         Threads::Threads
         Python3::Python
-        ${LIBUV_LIB}
-        ${HIREDIS_LIB}
-        ${REDIS_PLUS_PLUS_LIB}
         ${DPDK_LIBRARIES}
 )
 

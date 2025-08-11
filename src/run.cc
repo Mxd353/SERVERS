@@ -1,6 +1,7 @@
 #include <atomic>
 #include <csignal>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 
@@ -29,9 +30,11 @@ void signalHandler(int signal) {
   double latency_us_per_request =
       completed > 0 ? static_cast<double>(total_latency) / completed : 0.0;
 
+  std::cout << std::fixed << std::setprecision(2);
   std::cout << "Total Requests Completed: " << completed << "\n"
             << "Average Latency per Request (ms/op): "
-            << latency_us_per_request / 1'000.0 << std::endl;
+            << latency_us_per_request / 1'000.0 << "( "
+            << latency_us_per_request << " us/op)" << std::endl;
 
   std::exit(0);
 }

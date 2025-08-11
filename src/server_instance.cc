@@ -3,7 +3,6 @@
 #include <linux/if_packet.h>
 #include <net/if.h>
 #include <pcap.h>
-#include <sw/redis++/errors.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 

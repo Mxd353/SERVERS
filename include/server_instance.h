@@ -3,7 +3,6 @@
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <rte_ring.h>
-#include <sw/redis++/redis++.h>
 
 #include <atomic>
 #include <boost/asio.hpp>
@@ -57,7 +56,6 @@ class ServerInstance {
   std::weak_ptr<int> kv_migration_event_fd_ptr_;
 
   std::atomic<bool> running_{false};
-  std::unique_ptr<sw::redis::Redis> redis_;
 
   uint8_t fsm_;
 
