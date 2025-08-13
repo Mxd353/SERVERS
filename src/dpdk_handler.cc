@@ -8,7 +8,6 @@
 #include <rte_per_lcore.h>
 #include <unistd.h>
 
-#include <boost/redis/src.hpp>
 #include <fstream>
 #include <iostream>
 
@@ -234,26 +233,7 @@ int DPDKHandler::PortInit() {
   return 0;
 }
 
-inline void BuildIptoDBMapFlat(
-    std::shared_ptr<boost::redis::sync_connection> ip_to_db_flat[]) {
-  int base_port = 6380;
-  for (int subnet = 0; subnet < SUBNET_COUNT; ++subnet) {
-    for (int host = 1; host <= HOST_PER_SUBNET; ++host) {
-      int index = subnet * HOST_PER_SUBNET + (host - 1);
-
-      boost::redis::config cfg;
-      cfg.addr.host = "127.0.0.1";
-      cfg.addr.port = index + base_port;
-      auto conn = std::make_shared<boost::redis::sync_connection>();
-      conn->run(cfg);
-
-      redis_test(*conn);
-      ip_to_db_flat[index] = conn;
-    }
-  }
-}
-
-inline int LookupRedis(rte_be32_t ip_be) {
+inline int LookupDB(rte_be32_t ip_be) {
   uint32_t ip = rte_be_to_cpu_32(ip_be);
 
   uint8_t subnet = (ip >> 8) & 0xFF;
@@ -265,18 +245,28 @@ inline int LookupRedis(rte_be32_t ip_be) {
   return (subnet - SUBNET_BASE) * HOST_PER_SUBNET + (host - 1);
 }
 
+static int tommy_key_cmp(const void *arg, const void *obj) {
+  const char *key = static_cast<const char *>(arg);
+  const KVItem *item = static_cast<const KVItem *>(obj);
+  return memcmp(item->key, key, KEY_LENGTH);
+}
+
 void DPDKHandler::MainLoop(CoreInfo core_info) {
   thread_local uint16_t port = 0;
 
   thread_local uint lcore_id = core_info.first;
   thread_local uint16_t queue_id = core_info.second;
 
-  thread_local std::shared_ptr<boost::redis::sync_connection>
-      ip_to_db_flat[SUBNET_COUNT * HOST_PER_SUBNET];
-  BuildIptoDBMapFlat(ip_to_db_flat);
+  static thread_local ThreadLocalStorage tls[SUBNET_COUNT * HOST_PER_SUBNET];
+  static thread_local bool tommy_inited = false;
 
-  static thread_local boost::redis::request req;
-  static thread_local boost::redis::response<std::optional<std::string>> resp;
+  if (!tommy_inited) {
+    for (int i = 0; i < (SUBNET_COUNT * HOST_PER_SUBNET); ++i) {
+      tommy_hashlin_init(&tls[i].db);
+      tls[i].item_pool.resize(MAX_ITEMS_PER_CORE);
+    }
+    tommy_inited = true;
+  }
 
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
     rte_exit(EXIT_FAILURE, "Invalid lcore_id=%u\n", lcore_id);
@@ -303,16 +293,12 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
         continue;
       } else {
         for (uint16_t i = 0; i < nb_rx; i++) {
-          // struct rte_mbuf *resp_buf = rte_pktmbuf_clone(bufs[i],
-          // tx_mbufpool_);
           if (i + 1 < nb_rx)
             rte_prefetch0(rte_pktmbuf_mtod(bufs[i + 1], void *));
 
           rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr *);
-
           rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
           rte_prefetch0(ip_hdr + 1);
-
           if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
             rte_pktmbuf_free(bufs[i]);
             continue;
@@ -321,48 +307,64 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
           SwapMac(eth_hdr);
 
           rte_be32_t dst_addr = ip_hdr->dst_addr;
-
           ip_hdr->dst_addr = ip_hdr->src_addr;
           ip_hdr->src_addr = dst_addr;
 
           KVHeader *kv_header = reinterpret_cast<KVHeader *>(ip_hdr + 1);
-          kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
-
-          auto &db = ip_to_db_flat[LookupRedis(dst_addr)];
-
           uint8_t op = GET_OP(kv_header->combined);
           uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
+          kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
+
+          int db_index = LookupDB(dst_addr);
+
           auto value_ptr = kv_header->value1.data();
-          std::string_view key{kv_header->key.data(), KEY_LENGTH};
-          req.clear();
+          const char *key_ptr = kv_header->key.data();
+
           if (op == WRITE_REQUEST) {
-            std::string_view value{value_ptr, VALUE_LENGTH * 4};
-            req.push("SET", key, value);
-            db->exec(req, boost::redis::ignore);
+            const char *in_val = reinterpret_cast<const char *>(value_ptr);
+            uint32_t h = tommy_hash_u32(0, key_ptr, KEY_LENGTH);
+            KVItem *existing = static_cast<KVItem *>(tommy_hashlin_search(
+                &tls[db_index].db, tommy_key_cmp, (void *)key_ptr, h));
+            if (existing) {
+              rte_memcpy(existing->value, in_val, VALUE_LENGTH * 4);
+            } else {
+              if (tls[db_index].pool_index >= MAX_ITEMS_PER_CORE) {
+                tls[db_index].pool_index = 0;
+                RTE_LOG(WARNING, DB, "Item pool exhausted on core %u\n",
+                        lcore_id);
+              }
+              KVItem *item =
+                  &tls[db_index].item_pool[tls[db_index].pool_index++];
+
+              rte_memcpy(item->key, key_ptr, KEY_LENGTH);
+              rte_memcpy(item->value, in_val, VALUE_LENGTH * 4);
+              tommy_hashlin_insert(&tls[db_index].db, &item->node, item, h);
+            }
 
             if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
               if (auto server = GetServerByIp(dst_addr)) {
                 KVMigrateHeader *kv_migration_header =
                     (KVMigrateHeader *)(kv_header);
-                server->CacheMigrate(key, kv_migration_header->migration_id);
+                server->CacheMigrate(
+                    std::string_view(kv_header->key.data(), KEY_LENGTH),
+                    kv_migration_header->migration_id);
               }
               rte_pktmbuf_free(bufs[i]);
               continue;
             }
           } else {
-            req.push("GET", key);
-            resp = {};
-            db->exec(req, resp);
-
-            auto &val = std::get<0>(resp).value();
-            if (val) {
-              rte_memcpy(value_ptr, val.value().data(), VALUE_LENGTH * 4);
+            uint32_t h = tommy_hash_u32(0, key_ptr, KEY_LENGTH);
+            KVItem *existing = static_cast<KVItem *>(tommy_hashlin_search(
+                &tls[db_index].db, tommy_key_cmp, (void *)key_ptr, h));
+            if (existing) {
+              rte_memcpy(value_ptr, existing->value, VALUE_LENGTH * 4);
             } else {
               RTE_LOG(WARNING, DB,
                       "[%d.%d.%d.%d] Not find key: %.*s in core: %u\n",
                       DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data(),
                       lcore_id);
+              memset(value_ptr, 0, VALUE_LENGTH * 4);
             }
           }
 
@@ -371,9 +373,9 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
             RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", lcore_id);
             rte_pktmbuf_free(bufs[i]);
           }
-        }
-      }
-    }
+        }  // for nb_rx
+      }  // else nb_rx > 0
+    }  // while true
   } else {
     printf("Skip main lcore %u\n", lcore_id);
   }

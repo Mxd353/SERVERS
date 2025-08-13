@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 4.0)
 project(ClusterRun
     VERSION 1.0
     DESCRIPTION "Cluter Run"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # set(CMAKE_BUILD_TYPE Release)
@@ -48,6 +48,7 @@ set(TARGET_NAME run)
 
 add_executable(${TARGET_NAME}
     ${SOURCE_FILES}
+    ${TOMMYDS_SRC}
 )
 
 target_compile_definitions(${TARGET_NAME}
@@ -114,13 +115,36 @@ else()
     message(FATAL_ERROR "DPDK not found. Make sure pkg-config can find libdpdk.pc.")
 endif()
 
+set(TOMMYDS_SRC_DIR ${CMAKE_SOURCE_DIR}/tommyds)
+
+set(TOMMYDS_SOURCES
+    ${TOMMYDS_SRC_DIR}/tommyhash.c
+    ${TOMMYDS_SRC_DIR}/tommyhashlin.c
+    ${TOMMYDS_SRC_DIR}/tommylist.c
+)
+
+file(GLOB TOMMYDS_SRC
+    "${CMAKE_SOURCE_DIR}/tommyds/*.c"
+)
+message(STATUS "TommyDS sources: ${TOMMYDS_SRC}")
+
+add_library(tommyds STATIC ${TOMMYDS_SRC})
+
+set_target_properties(tommyds PROPERTIES
+    LINKER_LANGUAGE C
+    POSITION_INDEPENDENT_CODE ON 
+)
+
+target_include_directories(tommyds PUBLIC ${TOMMYDS_SRC_DIR})
+
+target_link_libraries(${TARGET_NAME} PRIVATE tommyds)
+
 target_include_directories(${TARGET_NAME}
     PUBLIC
         ${Boost_INCLUDE_DIRS}
         ${LIBUV_INCLUDE_DIR}
         ${DPDK_INCLUDE_DIRS}
         ${HIREDIS_HEADER}
-        ${REDIS_PLUS_PLUS_HEADER}
         include
         ${CMAKE_SOURCE_DIR}
 )
@@ -138,6 +162,7 @@ target_link_libraries(${TARGET_NAME}
         TBB::tbb
         Threads::Threads
         Python3::Python
+        tommyds
         ${DPDK_LIBRARIES}
 )
 

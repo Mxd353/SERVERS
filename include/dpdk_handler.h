@@ -6,6 +6,9 @@
 #include <rte_ip4.h>
 #include <rte_mbuf.h>
 
+extern "C" {
+#include "tommy.h"
+}
 #include "server_instance.h"
 
 #define RING_SIZE 1024
@@ -25,6 +28,19 @@
 constexpr int SUBNET_BASE = 7;
 constexpr int SUBNET_COUNT = 32;
 constexpr int HOST_PER_SUBNET = 32;
+constexpr int MAX_ITEMS_PER_CORE = 10'000;
+
+struct KVItem {
+  tommy_node node;
+  char key[KEY_LENGTH];
+  char value[VALUE_LENGTH * 4];
+} __attribute__((aligned(64)));
+
+struct ThreadLocalStorage {
+  tommy_hashlin db;
+  std::vector<KVItem> item_pool;
+  size_t pool_index = 0;
+};
 
 class DPDKHandler {
   using CoreInfo = std::pair<uint, uint16_t>;

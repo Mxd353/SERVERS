@@ -103,6 +103,7 @@ struct AskPacket : public BaseHeader {
 
 constexpr uint16_t IPV4_HDR_LEN = sizeof(struct rte_ipv4_hdr);
 constexpr uint16_t C_M_HDR_LEN = sizeof(struct KVHeader);
+constexpr uint16_t KVM_HDR_LEN = sizeof(struct KVMigrateHeader);
 
 const uint16_t TOTAL_LEN = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + C_M_HDR_LEN;
 template <typename T>

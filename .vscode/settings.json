@@ -76,7 +76,9 @@
         "typeindex": "cpp",
         "*.ipp": "cpp",
         "shared_mutex": "cpp",
-        "ranges": "cpp"
+        "ranges": "cpp",
+        "tommyhash.h": "c",
+        "tommyhashlin.h": "c"
     },
     "markdown.validate.enabled": true,
 }
