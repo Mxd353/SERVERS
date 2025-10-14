@@ -21,14 +21,13 @@
 #define RX_RING_SIZE 2048
 #define TX_RING_SIZE 1024
 #define SAFETY_FACTOR 1.5
+#define WORKER_NUM 32
 
-constexpr int SUBNET_BASE = 7;
+constexpr int SUBNET_BASE = 0;
 constexpr int SUBNET_COUNT = 32;
 constexpr int HOST_PER_SUBNET = 32;
 
 class DPDKHandler {
-  using CoreInfo = std::pair<uint, uint16_t>;
-
  public:
   DPDKHandler();
   ~DPDKHandler();
@@ -49,12 +48,25 @@ class DPDKHandler {
   rte_ether_addr s_eth_addr_;
   std::shared_mutex ip_map_mutex_;
   std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>> ip_to_server_;
+  std::array<rte_ring*, WORKER_NUM> all_rings_;
+
+  struct CoreInfo {
+    uint lcore_id;
+    uint16_t queue_id;
+    std::array<rte_ring*, WORKER_NUM>* all_rings;
+  };
+
   std::vector<CoreInfo> special_cores_;
   std::vector<CoreInfo> normal_cores_;
 
   struct CoreArgs {
     CoreInfo core_info;
     DPDKHandler* instance;
+  };
+
+  struct ipc_req {
+    uint8_t db_id;
+    rte_mbuf *mbuf;
   };
 
   std::vector<std::unique_ptr<CoreArgs>> core_args_;
