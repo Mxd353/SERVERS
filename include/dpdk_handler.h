@@ -53,22 +53,19 @@ class DPDKHandler {
   std::array<rte_ring*, WORKER_NUM> rx_rings_;
   std::array<rte_ring*, TX_CORE_NUM> tx_rings_;
 
+  enum class CoreType { Rx, Tx };
+
   struct CoreInfo {
     uint lcore_id;
     uint16_t queue_id;
+    CoreType type;
     std::array<rte_ring*, WORKER_NUM>* rx_rings;
     rte_ring* tx_ring;
 
-    CoreInfo(uint l, std::array<rte_ring*, WORKER_NUM>* rxrs)
-        : lcore_id(l), rx_rings(rxrs) {
-      queue_id = 0;
-      tx_ring = nullptr;
-    }
-
-    CoreInfo(uint l, rte_ring* txr) : lcore_id(l), tx_ring(txr) {
-      queue_id = 0;
-      rx_rings = nullptr;
-    }
+    CoreInfo(uint l, CoreType t,
+             std::array<rte_ring*, WORKER_NUM>* rxrs = nullptr,
+             rte_ring* txr = nullptr)
+        : lcore_id(l), queue_id(0), type(t), rx_rings(rxrs), tx_ring(txr) {}
   };
 
   std::vector<CoreInfo> rx_cores_;

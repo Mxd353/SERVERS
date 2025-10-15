@@ -508,9 +508,10 @@ void DPDKHandler::Start() {
 
   RTE_LCORE_FOREACH_WORKER(lcore_id) {
     if (count++ < RX_CORE_NUM) {
-      rx_cores_.push_back({lcore_id, &rx_rings_});
+      rx_cores_.push_back({lcore_id, CoreType::Rx, &rx_rings_});
     } else {
-      tx_cores_.push_back({lcore_id, tx_rings_[tx_count++]});
+      tx_cores_.push_back(
+          {lcore_id, CoreType::Tx, nullptr, tx_rings_[tx_count++]});
     }
   }
 
