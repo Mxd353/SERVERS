@@ -22,6 +22,8 @@
 #define TX_RING_SIZE 1024
 #define SAFETY_FACTOR 1.5
 #define WORKER_NUM 32
+#define RX_CORE_NUM 8
+#define TX_CORE_NUM 2
 
 constexpr int SUBNET_BASE = 0;
 constexpr int SUBNET_COUNT = 32;
@@ -48,16 +50,29 @@ class DPDKHandler {
   rte_ether_addr s_eth_addr_;
   std::shared_mutex ip_map_mutex_;
   std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>> ip_to_server_;
-  std::array<rte_ring*, WORKER_NUM> all_rings_;
+  std::array<rte_ring*, WORKER_NUM> rx_rings_;
+  std::array<rte_ring*, TX_CORE_NUM> tx_rings_;
 
   struct CoreInfo {
     uint lcore_id;
     uint16_t queue_id;
-    std::array<rte_ring*, WORKER_NUM>* all_rings;
+    std::array<rte_ring*, WORKER_NUM>* rx_rings;
+    rte_ring* tx_ring;
+
+    CoreInfo(uint l, std::array<rte_ring*, WORKER_NUM>* rxrs)
+        : lcore_id(l), rx_rings(rxrs) {
+      queue_id = 0;
+      tx_ring = nullptr;
+    }
+
+    CoreInfo(uint l, rte_ring* txr) : lcore_id(l), tx_ring(txr) {
+      queue_id = 0;
+      rx_rings = nullptr;
+    }
   };
 
-  std::vector<CoreInfo> special_cores_;
-  std::vector<CoreInfo> normal_cores_;
+  std::vector<CoreInfo> rx_cores_;
+  std::vector<CoreInfo> tx_cores_;
 
   struct CoreArgs {
     CoreInfo core_info;
@@ -66,24 +81,24 @@ class DPDKHandler {
 
   struct ipc_req {
     uint8_t db_id;
-    rte_mbuf *mbuf;
+    rte_mbuf* mbuf;
   };
 
   std::vector<std::unique_ptr<CoreArgs>> core_args_;
 
   static inline void SwapMac(rte_ether_hdr* eth_hdr);
   static inline void SwapIpv4(rte_ipv4_hdr* ip_hdr);
-  void MainLoop(CoreInfo core_info);
-  void SpecialLoop(CoreInfo core_info);
+  void RxLoop(CoreInfo core_info);
+  void TxLoop(CoreInfo core_info);
   int PortInit();
   inline void BuildIptoServerMap(
       const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
           servers);
   inline void LaunchThreads(
-      const std::vector<DPDKHandler::CoreInfo>& special_cores_,
-      const std::vector<DPDKHandler::CoreInfo>& normal_cores_);
-  static inline int LaunchNormalLcore(void* arg);
-  static inline int LaunchSpeciaLcore(void* arg);
+      const std::vector<DPDKHandler::CoreInfo>& rx_cores_,
+      const std::vector<DPDKHandler::CoreInfo>& tx_cores_);
+  static inline int LaunchRxLcore(void* arg);
+  static inline int LaunchTxLcore(void* arg);
 
   inline std::shared_ptr<ServerInstance> GetServerByIp(const rte_be32_t& ip) {
     auto it = ip_to_server_.find(ip);

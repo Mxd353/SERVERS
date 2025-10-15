@@ -179,10 +179,9 @@ int DPDKHandler::PortInit() {
   }
 
   /* Configure the Ethernet device. */
-  uint16_t nb_normal_cores = normal_cores_.size();
-  uint16_t nb_special_cores = special_cores_.size();
-  retval = rte_eth_dev_configure(
-      port, nb_normal_cores, nb_normal_cores + nb_special_cores, &port_conf);
+  uint16_t nb_rx_cores = rx_cores_.size();
+  uint16_t nb_tx_cores = tx_cores_.size();
+  retval = rte_eth_dev_configure(port, nb_rx_cores, nb_tx_cores, &port_conf);
   if (retval != 0) return retval;
 
   retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &rx_ring_size, &tx_ring_size);
@@ -192,24 +191,18 @@ int DPDKHandler::PortInit() {
   txconf = dev_info.default_txconf;
   txconf.offloads = port_conf_default.txmode.offloads;
 
-  uint16_t queue_id = 0;
-  for (uint i = 0; i < nb_normal_cores; i++) {
-    retval =
-        rte_eth_rx_queue_setup(port, queue_id, rx_ring_size,
-                               rte_eth_dev_socket_id(port), NULL, rx_mbufpool_);
+  for (uint16_t q = 0; q < nb_tx_cores; q++) {
+    retval = rte_eth_rx_queue_setup(
+        port, q, rx_ring_size, rte_eth_dev_socket_id(port), NULL, rx_mbufpool_);
     if (retval < 0) return retval;
-
-    retval = rte_eth_tx_queue_setup(port, queue_id, tx_ring_size,
-                                    rte_eth_dev_socket_id(port), &txconf);
-    if (retval < 0) return retval;
-    normal_cores_[i].queue_id = queue_id++;
+    rx_cores_[q].queue_id = q;
   }
 
-  for (uint i = 0; i < nb_special_cores; i++) {
-    retval = rte_eth_tx_queue_setup(port, queue_id, tx_ring_size,
+  for (uint16_t q = 0; q < nb_tx_cores; q++) {
+    retval = rte_eth_tx_queue_setup(port, q, tx_ring_size,
                                     rte_eth_dev_socket_id(port), &txconf);
     if (retval < 0) return retval;
-    special_cores_[i].queue_id = queue_id++;
+    tx_cores_[q].queue_id = q;
   }
 
   /* Starting Ethernet port. 8< */
@@ -271,12 +264,12 @@ inline int LookupWorker(rte_be32_t ip_be, uint8_t &subnet_out,
   return 0;
 }
 
-void DPDKHandler::MainLoop(CoreInfo core_info) {
+void DPDKHandler::RxLoop(CoreInfo core_info) {
   const uint16_t port = 0;
 
   thread_local uint lcore_id = core_info.lcore_id;
   thread_local uint16_t queue_id = core_info.queue_id;
-  thread_local auto &rings = *core_info.all_rings;
+  thread_local auto &rings = *core_info.rx_rings;
 
   thread_local std::shared_ptr<boost::redis::sync_connection>
       ip_to_db_flat[SUBNET_COUNT * HOST_PER_SUBNET];
@@ -396,9 +389,10 @@ void DPDKHandler::MainLoop(CoreInfo core_info) {
   }
 }
 
-void DPDKHandler::SpecialLoop(CoreInfo core_info) {
-  uint lcore_id = core_info.first;
-  uint16_t queue_id = core_info.second;
+void DPDKHandler::TxLoop(CoreInfo core_info) {
+  thread_local uint lcore_id = core_info.lcore_id;
+  thread_local uint16_t queue_id = core_info.queue_id;
+  thread_local auto &ring = *core_info.tx_ring;
 
   RTE_LOG(NOTICE, CORE, "[Special] %u polling queue: %hu\n", lcore_id,
           queue_id);
@@ -433,53 +427,51 @@ void DPDKHandler::SpecialLoop(CoreInfo core_info) {
   }
 }
 
-inline int DPDKHandler::LaunchNormalLcore(void *arg) {
+inline int DPDKHandler::LaunchRxLcore(void *arg) {
   CoreArgs *args = static_cast<CoreArgs *>(arg);
-  args->instance->MainLoop(args->core_info);
+  args->instance->RxLoop(args->core_info);
   return 0;
 }
 
-inline int DPDKHandler::LaunchSpeciaLcore(void *arg) {
+inline int DPDKHandler::LaunchTxLcore(void *arg) {
   CoreArgs *args = static_cast<CoreArgs *>(arg);
   (void)args;
-  // args->instance->SpecialLoop(args->core_info);
+  args->instance->TxLoop(args->core_info);
   return 0;
 }
 
 inline void DPDKHandler::LaunchThreads(
-    const std::vector<DPDKHandler::CoreInfo> &special_cores_,
-    const std::vector<DPDKHandler::CoreInfo> &normal_cores_) {
-  for (auto &lcore : special_cores_) {
-    uint core_id = lcore.first;
-    uint16_t queue_id = lcore.second;
+    const std::vector<DPDKHandler::CoreInfo> &rx_cores_,
+    const std::vector<DPDKHandler::CoreInfo> &tx_cores_) {
+  for (auto &lcore : rx_cores_) {
+    uint core_id = lcore.lcore_id;
 
     auto args = std::make_unique<CoreArgs>();
     args->instance = this;
-    args->core_info = std::make_pair(core_id, queue_id);
+    args->core_info = lcore;
 
     core_args_.push_back(std::move(args));
-    int ret = rte_eal_remote_launch(LaunchSpeciaLcore, core_args_.back().get(),
-                                    core_id);
+    int ret =
+        rte_eal_remote_launch(LaunchRxLcore, core_args_.back().get(), core_id);
     if (ret < 0) {
-      std::cerr << "Failed to launch special thread on core " << core_id
+      std::cerr << "Failed to launch rx thread on core " << core_id
                 << ", error: " << rte_strerror(-ret) << std::endl;
       return;
     }
   }
 
-  for (auto &lcore : normal_cores_) {
-    uint core_id = lcore.first;
-    uint16_t queue_id = lcore.second;
+  for (auto &lcore : tx_cores_) {
+    uint core_id = lcore.lcore_id;
 
     auto args = std::make_unique<CoreArgs>();
     args->instance = this;
-    args->core_info = std::make_pair(core_id, queue_id);
+    args->core_info = lcore;
 
     core_args_.push_back(std::move(args));
-    int ret = rte_eal_remote_launch(LaunchNormalLcore, core_args_.back().get(),
-                                    core_id);
+    int ret =
+        rte_eal_remote_launch(LaunchTxLcore, core_args_.back().get(), core_id);
     if (ret < 0) {
-      std::cerr << "Failed to launch normal thread on core " << core_id
+      std::cerr << "Failed to launch tx thread on core " << core_id
                 << ", error: " << rte_strerror(-ret) << std::endl;
       return;
     }
@@ -490,24 +482,35 @@ void DPDKHandler::Start() {
   uint16_t port = 0;
   uint nb_ports = rte_eth_dev_count_avail();
 
-  uint count = 0;
-  uint lcore_id;
-
   for (int i = 0; i < WORKER_NUM; i++) {
     char ring_name[32];
     snprintf(ring_name, sizeof(ring_name), "rx_ring_%d", i);
-    all_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
-                                    RING_F_MP_RTS_ENQ | RING_F_SC_DEQ);
-    if (all_rings_[i] == nullptr) {
+    rx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
+                                   RING_F_MP_RTS_ENQ | RING_F_SC_DEQ);
+    if (rx_rings_[i] == nullptr) {
       rte_exit(EXIT_FAILURE, "Failed to create ring %s\n", ring_name);
     }
   }
 
+  for (int i = 0; i < TX_CORE_NUM; i++) {
+    char ring_name[32];
+    snprintf(ring_name, sizeof(ring_name), "tx_ring_%d", i);
+    tx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
+                                   RING_F_MP_RTS_ENQ | RING_F_SC_DEQ);
+    if (tx_rings_[i] == nullptr) {
+      rte_exit(EXIT_FAILURE, "Failed to create ring %s\n", ring_name);
+    }
+  }
+
+  uint count = 0;
+  uint tx_count = 0;
+  uint lcore_id;
+
   RTE_LCORE_FOREACH_WORKER(lcore_id) {
-    if (count++ < 1) {
-      special_cores_.push_back({lcore_id, 0, &all_rings_});
+    if (count++ < RX_CORE_NUM) {
+      rx_cores_.push_back({lcore_id, &rx_rings_});
     } else {
-      normal_cores_.push_back({lcore_id, 0, &all_rings_});
+      tx_cores_.push_back({lcore_id, tx_rings_[tx_count++]});
     }
   }
 
@@ -516,8 +519,6 @@ void DPDKHandler::Start() {
       TX_MBUF_DATA_SIZE, rte_socket_id());
   if (tx_mbufpool_ == NULL) rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
 
-  // uint32_t pool_size =
-  //     (RX_RING_SIZE * 2 * normal_cores_.size()) * SAFETY_FACTOR;
   rx_mbufpool_ = rte_pktmbuf_pool_create(
       "RX_MBUF_POOL", RX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
       RX_MBUF_DATA_SIZE, rte_socket_id());
@@ -528,11 +529,12 @@ void DPDKHandler::Start() {
   if (PortInit() != 0)
     rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
 
-  LaunchThreads(special_cores_, normal_cores_);
+  LaunchThreads(rx_cores_, tx_cores_);
+
   while (true) {
     utils::monitor_mempool(rx_mbufpool_);
     utils::monitor_mempool(tx_mbufpool_);
-    for (size_t i = 0; i < normal_cores_.size(); ++i)
+    for (size_t i = 0; i < rx_cores_.size(); ++i)
       std::cout << rte_eth_rx_queue_count(port, i) << " | ";
     std::cout << std::endl;
     rte_delay_us_sleep(1000'000);
