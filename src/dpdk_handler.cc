@@ -310,7 +310,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           uint16_t src_port = rte_be_to_cpu_16(udp_hdr->src_port);
           uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
 
-          if (unlikely(dst_port != UDP_PORT)) {
+          if (unlikely(dst_port != UDP_PORT_KV)) {
             rte_pktmbuf_free(rx_pkts[i]);
             continue;
           }
