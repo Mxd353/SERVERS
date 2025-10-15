@@ -269,14 +269,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
 
   thread_local uint lcore_id = core_info.lcore_id;
   thread_local uint16_t queue_id = core_info.queue_id;
-  thread_local auto &rings = *core_info.rx_rings;
-
-  thread_local std::shared_ptr<boost::redis::sync_connection>
-      ip_to_db_flat[SUBNET_COUNT * HOST_PER_SUBNET];
-  BuildIptoDBMapFlat(ip_to_db_flat);
-
-  static thread_local boost::redis::request req;
-  static thread_local boost::redis::response<std::optional<std::string>> resp;
+  thread_local auto rx_rings = core_info.rx_rings;
 
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
     rte_exit(EXIT_FAILURE, "Invalid lcore_id=%u\n", lcore_id);
@@ -290,24 +283,25 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           "not be optimal.\n",
           port);
 
-    RTE_LOG(NOTICE, CORE, "[Normal] %u polling queue: %hu\n", lcore_id,
+    RTE_LOG(NOTICE, CORE, "[Rx Core %u] polling queue: %hu\n", lcore_id,
             queue_id);
 
-    rte_mbuf *bufs[BURST_SIZE];
+    rte_mbuf *rx_pkts[BURST_SIZE];
     while (true) {
-      uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
+      uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, rx_pkts, BURST_SIZE);
       if (unlikely(nb_rx <= 0)) {
         rte_pause();
         continue;
       } else {
         for (uint16_t i = 0; i < nb_rx; i++) {
           if (i + 1 < nb_rx)
-            rte_prefetch0(rte_pktmbuf_mtod(bufs[i + 1], void *));
+            rte_prefetch0(rte_pktmbuf_mtod(rx_pkts[i + 1], void *));
 
-          rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr *);
+          rte_ether_hdr *eth_hdr =
+              rte_pktmbuf_mtod(rx_pkts[i], rte_ether_hdr *);
           rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
           if (unlikely(ip_hdr->next_proto_id != IPPROTO_UDP)) {
-            rte_pktmbuf_free(bufs[i]);
+            rte_pktmbuf_free(rx_pkts[i]);
             continue;
           }
           struct rte_udp_hdr *udp_hdr =
@@ -317,7 +311,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
 
           if (unlikely(dst_port != UDP_PORT)) {
-            rte_pktmbuf_free(bufs[i]);
+            rte_pktmbuf_free(rx_pkts[i]);
             continue;
           }
 
@@ -326,61 +320,63 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           ip_hdr->dst_addr = ip_hdr->src_addr;
           ip_hdr->src_addr = dst_addr;
 
-          KVHeader *kv_header = reinterpret_cast<KVHeader *>(udp_hdr + 1);
-          kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
-
           uint8_t worker_id, db_id;
           if (LookupWorker(dst_addr, worker_id, db_id) == 0) {
-            rte_pktmbuf_free(bufs[i]);
+            rte_pktmbuf_free(rx_pkts[i]);
             RTE_LOG(WARNING, DB,
                     "Not find worker for [%d.%d.%d.%d] in core: %u\n",
                     DECODE_IP(dst_addr), lcore_id);
             continue;
           }
 
-          rte_ring_enqueue(rings[worker_id], bufs[i]);
-
-          uint8_t op = GET_OP(kv_header->combined);
-          uint8_t is_req = GET_IS_REQ(kv_header->combined);
-
-          auto value_ptr = kv_header->value1.data();
-          std::string_view key{kv_header->key.data(), KEY_LENGTH};
-          req.clear();
-          if (op == WRITE_REQUEST) {
-            std::string_view value{value_ptr, VALUE_LENGTH * 4};
-            req.push("SET", key, value);
-            db->exec(req, boost::redis::ignore);
-
-            if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
-              if (auto server = GetServerByIp(dst_addr)) {
-                KVMigrateHeader *kv_migration_header =
-                    (KVMigrateHeader *)(kv_header);
-                server->CacheMigrate(key, kv_migration_header->migration_id);
-              }
-              rte_pktmbuf_free(bufs[i]);
-              continue;
-            }
-          } else {
-            req.push("GET", key);
-            resp = {};
-            db->exec(req, resp);
-
-            auto &val = std::get<0>(resp).value();
-            if (val) {
-              rte_memcpy(value_ptr, val.value().data(), VALUE_LENGTH * 4);
-            } else {
-              RTE_LOG(WARNING, DB,
-                      "[%d.%d.%d.%d] Not find key: %.*s in core: %u\n",
-                      DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data(),
-                      lcore_id);
-            }
+          if (unlikely(rte_ring_enqueue((*rx_rings)[worker_id], rx_pkts[i]) < 0)) {
+            rte_pktmbuf_free(rx_pkts[i]);
           }
 
-          uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &bufs[i], 1);
-          if (unlikely(nb_tx < 1)) {
-            RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", lcore_id);
-            rte_pktmbuf_free(bufs[i]);
-          }
+          // KVHeader *kv_header = reinterpret_cast<KVHeader *>(udp_hdr + 1);
+          // kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
+
+          // uint8_t op = GET_OP(kv_header->combined);
+          // uint8_t is_req = GET_IS_REQ(kv_header->combined);
+
+          // auto value_ptr = kv_header->value1.data();
+          // std::string_view key{kv_header->key.data(), KEY_LENGTH};
+          // req.clear();
+          // if (op == WRITE_REQUEST) {
+          //   std::string_view value{value_ptr, VALUE_LENGTH * 4};
+          //   req.push("SET", key, value);
+          //   db->exec(req, boost::redis::ignore);
+
+          //   if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
+          //     if (auto server = GetServerByIp(dst_addr)) {
+          //       KVMigrateHeader *kv_migration_header =
+          //           (KVMigrateHeader *)(kv_header);
+          //       server->CacheMigrate(key, kv_migration_header->migration_id);
+          //     }
+          //     rte_pktmbuf_free(bufs[i]);
+          //     continue;
+          //   }
+          // } else {
+          //   req.push("GET", key);
+          //   resp = {};
+          //   db->exec(req, resp);
+
+          //   auto &val = std::get<0>(resp).value();
+          //   if (val) {
+          //     rte_memcpy(value_ptr, val.value().data(), VALUE_LENGTH * 4);
+          //   } else {
+          //     RTE_LOG(WARNING, DB,
+          //             "[%d.%d.%d.%d] Not find key: %.*s in core: %u\n",
+          //             DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data(),
+          //             lcore_id);
+          //   }
+          // }
+
+          // uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &bufs[i], 1);
+          // if (unlikely(nb_tx < 1)) {
+          //   RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", lcore_id);
+          //   rte_pktmbuf_free(bufs[i]);
+          // }
         }
       }
     }
@@ -390,40 +386,63 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
 }
 
 void DPDKHandler::TxLoop(CoreInfo core_info) {
+  const uint16_t port = 0;
+
   thread_local uint lcore_id = core_info.lcore_id;
   thread_local uint16_t queue_id = core_info.queue_id;
-  thread_local auto &ring = *core_info.tx_ring;
+  thread_local auto *tx_ring = core_info.tx_ring;
 
-  RTE_LOG(NOTICE, CORE, "[Special] %u polling queue: %hu\n", lcore_id,
+  RTE_LOG(NOTICE, CORE, "[TX Core %u] polling queue: %hu\n", lcore_id,
           queue_id);
 
-  while (true) {
-    std::vector<uint8_t> *packet_data = nullptr;
-    if (rte_ring_dequeue(kv_migration_ring, (void **)&packet_data) == 0) {
-      if (packet_data) {
-        rte_mbuf *mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
-        if (!mbuf) {
-          std::cerr << "Failed to allocate mbuf" << std::endl;
-          delete packet_data;
-          continue;
-        }
-        char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
-        rte_memcpy(mbuf_data, packet_data->data(), packet_data->size());
+  rte_mbuf *tx_pkts[BURST_SIZE];
 
-        rte_pktmbuf_data_len(mbuf) = packet_data->size();
-        rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf);
-        delete packet_data;
-        int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
-        if (ret < 1) {
-          RTE_LOG(ERR, CORE, "Send error: %s (errno=%d)\n", rte_strerror(-ret),
-                  -ret);
-          rte_pktmbuf_free(mbuf);
-          continue;
+  while (true) {
+    uint16_t nb_pkts = rte_ring_dequeue_burst(
+        tx_ring, reinterpret_cast<void **>(tx_pkts), BURST_SIZE, nullptr);
+
+    if (unlikely(nb_pkts <= 0)) {
+      rte_pause();
+      continue;
+    } else {
+      uint16_t nb_sent = rte_eth_tx_burst(port, queue_id, tx_pkts, nb_pkts);
+
+      if (unlikely(nb_sent < nb_pkts)) {
+        for (uint16_t i = nb_sent; i < nb_pkts; i++) {
+          rte_pktmbuf_free(tx_pkts[i]);
         }
       }
-    } else {
-      rte_delay_us_sleep(10);
     }
+
+    RTE_LOG(NOTICE, CORE, "[TX Core %u] exiting\n", lcore_id);
+    return;
+    // std::vector<uint8_t> *packet_data = nullptr;
+    // if (rte_ring_dequeue(tx_ring, (void **)&packet_data) == 0) {
+    //   if (packet_data) {
+    //     rte_mbuf *mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
+    //     if (!mbuf) {
+    //       std::cerr << "Failed to allocate mbuf" << std::endl;
+    //       delete packet_data;
+    //       continue;
+    //     }
+    //     char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
+    //     rte_memcpy(mbuf_data, packet_data->data(), packet_data->size());
+
+    //     rte_pktmbuf_data_len(mbuf) = packet_data->size();
+    //     rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf);
+    //     delete packet_data;
+    //     int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
+    //     if (ret < 1) {
+    //       RTE_LOG(ERR, CORE, "Send error: %s (errno=%d)\n",
+    //       rte_strerror(-ret),
+    //               -ret);
+    //       rte_pktmbuf_free(mbuf);
+    //       continue;
+    //     }
+    //   }
+    // } else {
+    //   rte_delay_us_sleep(10);
+    // }
   }
 }
 

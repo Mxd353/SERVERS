@@ -18,7 +18,9 @@
 #define GET_OP(combined) static_cast<uint8_t>(((combined) >> 10) & 0x03)
 #define GET_HOT_QUERY(combined) static_cast<uint8_t>(((combined) >> 8) & 0x03)
 
-#define UDP_PORT 50000
+#define UDP_PORT_KV 50000
+#define UDP_PORT_MI 50001
+#define UDP_PORT_CM 50002
 
 #define KEY_LENGTH 16
 #define VALUE_LENGTH 4
@@ -59,7 +61,7 @@ struct SockConfig {
 
 #pragma pack(push, 1)
 
-struct KVHeader {
+struct KVRequest {
   uint8_t dev_info;  // DevID_t (5 bits) | DevType_t (3 bits)
   uint32_t request_id = 0;
   uint8_t combined;  // is_req(4 bit) | op(2 bit) | hot_query(2 bit)
@@ -70,11 +72,61 @@ struct KVHeader {
   std::array<char, VALUE_LENGTH> value4{};
 };
 
+struct KVMigrate : public KVRequest {  // pick up from KVRequest
+  uint32_t migration_id = 0;
+  uint8_t src_rack_id = 0;
+  uint8_t dst_rack_id = 0;
+  uint16_t cache_index = 0;
+  uint16_t total_keys = 0;
+};
+
+struct MigrationInfo {
+  uint32_t request_id = 0;
+  uint32_t migration_id = 0;
+  uint8_t migration_status = 0;
+  uint8_t src_rack_id = 0;
+  uint8_t dst_rack_id = 0;
+};
+
+struct CacheMigrate {
+  uint32_t request_id = 0;
+  uint32_t migration_id = 0;
+  std::array<char, KEY_LENGTH> key{};
+};
+
 #pragma pack(pop)
 
-constexpr uint16_t IPV4_HDR_LEN = sizeof(struct rte_ipv4_hdr);
-constexpr uint16_t UDP_HDR_LEN = sizeof(struct rte_udp_hdr);
-constexpr uint16_t C_M_HDR_LEN = sizeof(struct KVHeader);
+constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
+constexpr uint16_t UDP_HDR_LEN = sizeof(rte_udp_hdr);
+constexpr uint16_t KV_HDR_LEN = sizeof(KVRequest);
 
 const uint16_t TOTAL_LEN =
-    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + C_M_HDR_LEN;
+    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + KV_HDR_LEN;
+
+template <typename PayloadType>
+struct PacketTraits {
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_KV;
+  static constexpr uint16_t DstPort = UDP_PORT_KV;
+};
+
+template <>
+struct PacketTraits<KVRequest> {
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_KV;
+  static constexpr uint16_t DstPort = UDP_PORT_KV;
+};
+
+template <>
+struct PacketTraits<MigrationInfo> {
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_MI;
+  static constexpr uint16_t DstPort = UDP_PORT_MI;
+};
+
+template <>
+struct PacketTraits<CacheMigrate> {
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_CM;
+  static constexpr uint16_t DstPort = UDP_PORT_CM;
+};

@@ -2,6 +2,7 @@
 
 #include <net/ethernet.h>
 #include <netinet/ip.h>
+#include <netinet/udp.h>
 #include <rte_ring.h>
 
 #include <atomic>
