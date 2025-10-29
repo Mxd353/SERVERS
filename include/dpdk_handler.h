@@ -85,9 +85,11 @@ class DPDKHandler {
 
   static inline void SwapMac(rte_ether_hdr* eth_hdr);
   static inline void SwapIpv4(rte_ipv4_hdr* ip_hdr);
+  int PortInit();
   void RxLoop(CoreInfo core_info);
   void TxLoop(CoreInfo core_info);
-  int PortInit();
+  void DBWorker();
+
   inline void BuildIptoServerMap(
       const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
           servers);

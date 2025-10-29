@@ -446,6 +446,9 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
   }
 }
 
+void DPDKHandler::DBWorker() {
+}
+
 inline int DPDKHandler::LaunchRxLcore(void *arg) {
   CoreArgs *args = static_cast<CoreArgs *>(arg);
   args->instance->RxLoop(args->core_info);
