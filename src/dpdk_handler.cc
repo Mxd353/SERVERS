@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <boost/asio.hpp>
+#include <boost/redis/connection.hpp>
 #include <boost/redis/src.hpp>
 #include <fstream>
 #include <iostream>
@@ -305,8 +306,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
             rte_pktmbuf_free(rx_pkts[i]);
             continue;
           }
-          struct rte_udp_hdr* udp_hdr =
-              reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
+          rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
 
           uint16_t src_port = rte_be_to_cpu_16(udp_hdr->src_port);
           uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
@@ -456,20 +456,48 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
                            rte_ring* rx_ring) {
   if (unlikely(port_range.first >= port_range.second)) return;
+
+  net::io_context ioc;
+
   std::vector<std::shared_ptr<boost::redis::connection>> conns;
   conns.reserve(port_range.second - port_range.first + 1);
 
-  boost::redis::config cfg;
-  cfg.addr.host = "127.0.0.1";
-
   for (uint i = port_range.first; i <= port_range.second; i++) {
+    boost::redis::config cfg;
+    cfg.addr.host = "127.0.0.1";
     cfg.addr.port = std::to_string(i);
-    conns.emplace_back();
-    conns.back().connect(cfg);
+
+    auto conn = std::make_shared<boost::redis::connection>(ioc);
+    conn->async_run(cfg, {}, net::consign(net::detached, conn));
+    conns.push_back(conn);
+
     RTE_LOG(INFO, DB, "DBWorker connected to Redis port %d\n", i);
-    auto conn = std::make_shared<boost::redis::connection>(
-        co_await net::this_coro::executor);
-    conn->async_run(cfg, {}, boost::asio::consign(net::detached, conn));
+  }
+
+  std::thread io_thread([&ioc]() { ioc.run(); });
+
+  ipc_req* req;
+  boost::redis::request db_req;
+  while (true) {
+    if (rte_ring_dequeue(rx_ring, (void**)&req) == 0) {
+      rte_mbuf* mbuf = req->mbuf;
+      uint db_id = req->db_id;
+      auto& conn = conns[db_id % conns.size()];
+
+      rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(mbuf, rte_ether_hdr*);
+      rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
+      rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
+      KVRequest* kv_header = reinterpret_cast<KVRequest*>(udp_hdr + 1);
+
+      kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
+      uint8_t op = GET_OP(kv_header->combined);
+      uint8_t is_req = GET_IS_REQ(kv_header->combined);
+      auto value_ptr = kv_header->value1.data();
+      std::string_view key{kv_header->key.data(), KEY_LENGTH};
+
+    } else {
+      rte_pause();
+    }
   }
 }
 
