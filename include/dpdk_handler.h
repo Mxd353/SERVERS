@@ -46,6 +46,7 @@ class DPDKHandler {
   volatile bool initialized_ = false;
   rte_mempool* tx_mbufpool_;
   rte_mempool* rx_mbufpool_;
+  rte_mempool* ipc_mempool_;
   int ret_;
   rte_ether_addr s_eth_addr_;
   std::shared_mutex ip_map_mutex_;
@@ -88,7 +89,7 @@ class DPDKHandler {
   int PortInit();
   void RxLoop(CoreInfo core_info);
   void TxLoop(CoreInfo core_info);
-  void DBWorker();
+  void DBWorker(std::pair<uint, uint> port_range, rte_ring* rx_ring);
 
   inline void BuildIptoServerMap(
       const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&

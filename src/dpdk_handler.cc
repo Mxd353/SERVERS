@@ -5,9 +5,11 @@
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
 #include <rte_log.h>
+#include <rte_mempool.h>
 #include <rte_per_lcore.h>
 #include <unistd.h>
 
+#include <boost/asio.hpp>
 #include <boost/redis/src.hpp>
 #include <fstream>
 #include <iostream>
@@ -15,14 +17,14 @@
 #include "lib/sync_connection.hpp"
 #include "lib/utils.h"
 
+namespace net = boost::asio;
+
 std::atomic<uint64_t> total_latency_us{0};
 std::atomic<size_t> completed_request_count{0};
 
 std::ofstream outfile("server.output");
 
-#include <rte_mempool.h>
-
-inline void redis_test(boost::redis::sync_connection &conn) {
+inline void redis_test(boost::redis::sync_connection& conn) {
   try {
     boost::redis::request req;
     boost::redis::response<std::string> resp;
@@ -36,7 +38,7 @@ inline void redis_test(boost::redis::sync_connection &conn) {
       std::cerr << "[redis_test] Unexpected ping reply: " << reply << std::endl;
       std::exit(1);
     }
-  } catch (const std::exception &e) {
+  } catch (const std::exception& e) {
     std::cerr << "[redis_test] Redis exception: " << e.what() << std::endl;
     std::exit(1);
   } catch (...) {
@@ -53,10 +55,10 @@ DPDKHandler::~DPDKHandler() {
 }
 
 inline void DPDKHandler::BuildIptoServerMap(
-    const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>
-        &servers) {
+    const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
+        servers) {
   uint db_size = 0;
-  for (const auto &server : servers) {
+  for (const auto& server : servers) {
     if (!server.second) {
       RTE_LOG(ERR, DB, "Invalid ServerInstance pointer!\n");
       continue;
@@ -69,9 +71,9 @@ inline void DPDKHandler::BuildIptoServerMap(
 }
 
 bool DPDKHandler::Initialize(
-    const std::string &conf, char *program_name,
-    const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>
-        &servers) {
+    const std::string& conf, char* program_name,
+    const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
+        servers) {
   std::vector<std::string> args;
   args.push_back(program_name);
   std::ifstream file(conf);
@@ -84,9 +86,9 @@ bool DPDKHandler::Initialize(
     args.push_back(token);
   }
 
-  std::vector<char *> argv;
-  for (auto &arg : args) {
-    argv.push_back(const_cast<char *>(arg.c_str()));
+  std::vector<char*> argv;
+  for (auto& arg : args) {
+    argv.push_back(const_cast<char*>(arg.c_str()));
   }
 
   ret_ = rte_eal_init(argv.size(), argv.data());
@@ -103,7 +105,7 @@ bool DPDKHandler::Initialize(
     rte_exit(EXIT_FAILURE, "Cannot create kv_migration_ring\n");
   }
 
-  for (const auto &server : servers) {
+  for (const auto& server : servers) {
     server.second->SetKvMigrationRing(kv_migration_ring);
   }
 
@@ -114,14 +116,14 @@ bool DPDKHandler::Initialize(
   return initialized_;
 }
 
-inline void DPDKHandler::SwapMac(rte_ether_hdr *eth_hdr) {
+inline void DPDKHandler::SwapMac(rte_ether_hdr* eth_hdr) {
   rte_ether_addr tmp_mac;
   rte_ether_addr_copy(&eth_hdr->src_addr, &tmp_mac);
   rte_ether_addr_copy(&eth_hdr->dst_addr, &eth_hdr->src_addr);
   rte_ether_addr_copy(&tmp_mac, &eth_hdr->dst_addr);
 }
 
-inline void DPDKHandler::SwapIpv4(rte_ipv4_hdr *ip_hdr) {
+inline void DPDKHandler::SwapIpv4(rte_ipv4_hdr* ip_hdr) {
   uint32_t tmp_ip = ip_hdr->src_addr;
   ip_hdr->src_addr = ip_hdr->dst_addr;
   ip_hdr->dst_addr = tmp_ip;
@@ -246,8 +248,8 @@ inline void BuildIptoDBMapFlat(
   }
 }
 
-inline int LookupWorker(rte_be32_t ip_be, uint8_t &subnet_out,
-                        uint8_t &host_out) {
+inline int LookupWorker(rte_be32_t ip_be, uint8_t& subnet_out,
+                        uint8_t& host_out) {
   uint32_t ip = rte_be_to_cpu_32(ip_be);
 
   uint8_t a = (ip >> 24) & 0xFF;
@@ -286,7 +288,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
     RTE_LOG(NOTICE, CORE, "[Rx Core %u] polling queue: %hu\n", lcore_id,
             queue_id);
 
-    rte_mbuf *rx_pkts[BURST_SIZE];
+    rte_mbuf* rx_pkts[BURST_SIZE];
     while (true) {
       uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, rx_pkts, BURST_SIZE);
       if (unlikely(nb_rx <= 0)) {
@@ -295,17 +297,16 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
       } else {
         for (uint16_t i = 0; i < nb_rx; i++) {
           if (i + 1 < nb_rx)
-            rte_prefetch0(rte_pktmbuf_mtod(rx_pkts[i + 1], void *));
+            rte_prefetch0(rte_pktmbuf_mtod(rx_pkts[i + 1], void*));
 
-          rte_ether_hdr *eth_hdr =
-              rte_pktmbuf_mtod(rx_pkts[i], rte_ether_hdr *);
-          rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
+          rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(rx_pkts[i], rte_ether_hdr*);
+          rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
           if (unlikely(ip_hdr->next_proto_id != IPPROTO_UDP)) {
             rte_pktmbuf_free(rx_pkts[i]);
             continue;
           }
-          struct rte_udp_hdr *udp_hdr =
-              reinterpret_cast<rte_udp_hdr *>(ip_hdr + 1);
+          struct rte_udp_hdr* udp_hdr =
+              reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
 
           uint16_t src_port = rte_be_to_cpu_16(udp_hdr->src_port);
           uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
@@ -329,8 +330,14 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
             continue;
           }
 
-          if (unlikely(rte_ring_enqueue((*rx_rings)[worker_id], rx_pkts[i]) < 0)) {
-            rte_pktmbuf_free(rx_pkts[i]);
+          ipc_req* req;
+          if (rte_mempool_get(ipc_mempool_, (void**)&req) == 0) {
+            req->db_id = db_id;
+            req->mbuf = rx_pkts[i];
+            if (unlikely(rte_ring_enqueue((*rx_rings)[worker_id], req) < 0)) {
+              rte_pktmbuf_free(rx_pkts[i]);
+              rte_mempool_put(ipc_mempool_, req);
+            }
           }
 
           // KVHeader *kv_header = reinterpret_cast<KVHeader *>(udp_hdr + 1);
@@ -390,16 +397,16 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 
   thread_local uint lcore_id = core_info.lcore_id;
   thread_local uint16_t queue_id = core_info.queue_id;
-  thread_local auto *tx_ring = core_info.tx_ring;
+  thread_local auto* tx_ring = core_info.tx_ring;
 
   RTE_LOG(NOTICE, CORE, "[TX Core %u] polling queue: %hu\n", lcore_id,
           queue_id);
 
-  rte_mbuf *tx_pkts[BURST_SIZE];
+  rte_mbuf* tx_pkts[BURST_SIZE];
 
   while (true) {
     uint16_t nb_pkts = rte_ring_dequeue_burst(
-        tx_ring, reinterpret_cast<void **>(tx_pkts), BURST_SIZE, nullptr);
+        tx_ring, reinterpret_cast<void**>(tx_pkts), BURST_SIZE, nullptr);
 
     if (unlikely(nb_pkts <= 0)) {
       rte_pause();
@@ -446,26 +453,43 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
   }
 }
 
-void DPDKHandler::DBWorker() {
+void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
+                           rte_ring* rx_ring) {
+  if (unlikely(port_range.first >= port_range.second)) return;
+  std::vector<std::shared_ptr<boost::redis::connection>> conns;
+  conns.reserve(port_range.second - port_range.first + 1);
+
+  boost::redis::config cfg;
+  cfg.addr.host = "127.0.0.1";
+
+  for (uint i = port_range.first; i <= port_range.second; i++) {
+    cfg.addr.port = std::to_string(i);
+    conns.emplace_back();
+    conns.back().connect(cfg);
+    RTE_LOG(INFO, DB, "DBWorker connected to Redis port %d\n", i);
+    auto conn = std::make_shared<boost::redis::connection>(
+        co_await net::this_coro::executor);
+    conn->async_run(cfg, {}, boost::asio::consign(net::detached, conn));
+  }
 }
 
-inline int DPDKHandler::LaunchRxLcore(void *arg) {
-  CoreArgs *args = static_cast<CoreArgs *>(arg);
+inline int DPDKHandler::LaunchRxLcore(void* arg) {
+  CoreArgs* args = static_cast<CoreArgs*>(arg);
   args->instance->RxLoop(args->core_info);
   return 0;
 }
 
-inline int DPDKHandler::LaunchTxLcore(void *arg) {
-  CoreArgs *args = static_cast<CoreArgs *>(arg);
+inline int DPDKHandler::LaunchTxLcore(void* arg) {
+  CoreArgs* args = static_cast<CoreArgs*>(arg);
   (void)args;
   args->instance->TxLoop(args->core_info);
   return 0;
 }
 
 inline void DPDKHandler::LaunchThreads(
-    const std::vector<DPDKHandler::CoreInfo> &rx_cores_,
-    const std::vector<DPDKHandler::CoreInfo> &tx_cores_) {
-  for (auto &lcore : rx_cores_) {
+    const std::vector<DPDKHandler::CoreInfo>& rx_cores_,
+    const std::vector<DPDKHandler::CoreInfo>& tx_cores_) {
+  for (auto& lcore : rx_cores_) {
     uint core_id = lcore.lcore_id;
 
     auto args = std::make_unique<CoreArgs>();
@@ -482,7 +506,7 @@ inline void DPDKHandler::LaunchThreads(
     }
   }
 
-  for (auto &lcore : tx_cores_) {
+  for (auto& lcore : tx_cores_) {
     uint core_id = lcore.lcore_id;
 
     auto args = std::make_unique<CoreArgs>();
@@ -540,12 +564,19 @@ void DPDKHandler::Start() {
   tx_mbufpool_ = rte_pktmbuf_pool_create(
       "TX_MBUF_POOL", TX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
       TX_MBUF_DATA_SIZE, rte_socket_id());
-  if (tx_mbufpool_ == NULL) rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+  if (tx_mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create tx mbuf pool\n");
 
   rx_mbufpool_ = rte_pktmbuf_pool_create(
       "RX_MBUF_POOL", RX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
       RX_MBUF_DATA_SIZE, rte_socket_id());
-  if (rx_mbufpool_ == NULL) rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+  if (rx_mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create rx mbuf pool\n");
+
+  ipc_mempool_ = rte_mempool_create("ipc_req_pool", 8191, sizeof(ipc_req), 0, 0,
+                                    NULL, NULL, NULL, NULL, rte_socket_id(), 0);
+  if (ipc_mempool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create ipc mbuf pool\n");
 
   rte_ether_unformat_addr("aa:bb:cc:dd:ee:ff", &s_eth_addr_);
 
