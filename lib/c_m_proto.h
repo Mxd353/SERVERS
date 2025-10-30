@@ -99,6 +99,8 @@ struct CacheMigrate {
 constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
 constexpr uint16_t UDP_HDR_LEN = sizeof(rte_udp_hdr);
 constexpr uint16_t KV_HDR_LEN = sizeof(KVRequest);
+constexpr uint16_t KV_HEADER_OFFSET =
+    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN;
 
 const uint16_t TOTAL_LEN =
     RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + KV_HDR_LEN;

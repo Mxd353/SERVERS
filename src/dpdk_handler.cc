@@ -308,7 +308,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           }
           rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
 
-          uint16_t src_port = rte_be_to_cpu_16(udp_hdr->src_port);
+          // uint16_t src_port = rte_be_to_cpu_16(udp_hdr->src_port);
           uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
 
           if (unlikely(dst_port != UDP_PORT_KV)) {
@@ -455,46 +455,71 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 
 void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
                            rte_ring* rx_ring) {
+  using namespace boost;
   if (unlikely(port_range.first >= port_range.second)) return;
 
-  net::io_context ioc;
-
+  auto ioc = std::make_shared<net::io_context>();
   std::vector<std::shared_ptr<boost::redis::connection>> conns;
-  conns.reserve(port_range.second - port_range.first + 1);
 
-  for (uint i = port_range.first; i <= port_range.second; i++) {
+  for (uint i = port_range.first; i <= port_range.second; ++i) {
     boost::redis::config cfg;
     cfg.addr.host = "127.0.0.1";
     cfg.addr.port = std::to_string(i);
 
-    auto conn = std::make_shared<boost::redis::connection>(ioc);
+    auto conn = std::make_shared<redis::connection>(ioc->get_executor());
     conn->async_run(cfg, {}, net::consign(net::detached, conn));
     conns.push_back(conn);
-
-    RTE_LOG(INFO, DB, "DBWorker connected to Redis port %d\n", i);
   }
 
-  std::thread io_thread([&ioc]() { ioc.run(); });
+  std::thread io_thread([&ioc] { ioc->run(); });
 
-  ipc_req* req;
-  boost::redis::request db_req;
+  ipc_req* req = nullptr;
   while (true) {
     if (rte_ring_dequeue(rx_ring, (void**)&req) == 0) {
-      rte_mbuf* mbuf = req->mbuf;
-      uint db_id = req->db_id;
-      auto& conn = conns[db_id % conns.size()];
+      auto conn = conns[req->db_id % conns.size()];
 
-      rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(mbuf, rte_ether_hdr*);
-      rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
-      rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
-      KVRequest* kv_header = reinterpret_cast<KVRequest*>(udp_hdr + 1);
+      net::post(*ioc, [conn, tx_rings = &tx_rings_, req_copy = *req]() {
+        KVRequest* kv_header = rte_pktmbuf_mtod_offset(
+            req_copy.mbuf, KVRequest*, KV_HEADER_OFFSET);
+        kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
+        // uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
-      kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
-      uint8_t op = GET_OP(kv_header->combined);
-      uint8_t is_req = GET_IS_REQ(kv_header->combined);
-      auto value_ptr = kv_header->value1.data();
-      std::string_view key{kv_header->key.data(), KEY_LENGTH};
+        auto value_ptr = kv_header->value1.data();
+        std::string_view key{kv_header->key.data(), KEY_LENGTH};
 
+        auto db_req = std::make_shared<redis::request>();
+
+        if (GET_OP(kv_header->combined) == WRITE_REQUEST) {
+          std::string_view value{kv_header->value1.data(), VALUE_LENGTH * 4};
+          db_req->push("SET", key, value);
+
+          conn->async_exec(*db_req, redis::ignore, net::detached);
+          rte_ring_enqueue((*tx_rings)[req_copy.db_id % TX_CORE_NUM],
+                           req_copy.mbuf);
+        } else {
+          db_req->push("GET", key);
+          auto resp = std::make_shared<redis::response<std::string>>();
+
+          conn->async_exec(
+              *db_req, *resp,
+              [resp, value_ptr, tx_rings, key, req_copy](auto ec, auto) {
+                if (!ec) {
+                  auto& val = std::get<0>(*resp).value();
+                  if (!val.empty()) {
+                    rte_memcpy(value_ptr, val.data(), VALUE_LENGTH * 4);
+                  } else {
+                    RTE_LOG(WARNING, DB, "[DB %d] Not find key: %.*s\n",
+                            req_copy.db_id, KEY_LENGTH, key.data());
+                  }
+                } else {
+                  RTE_LOG(ERR, DB, "[DB %d] Redis GET failed: %s\n",
+                          req_copy.db_id, ec.message().c_str());
+                }
+                rte_ring_enqueue((*tx_rings)[req_copy.db_id % TX_CORE_NUM],
+                                 req_copy.mbuf);
+              });
+        }
+      });
     } else {
       rte_pause();
     }
