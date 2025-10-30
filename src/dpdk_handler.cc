@@ -18,7 +18,23 @@
 #include "lib/sync_connection.hpp"
 #include "lib/utils.h"
 
-namespace net = boost::asio;
+using string_response_32 = boost::redis::response<
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>,
+    std::optional<std::string>, std::optional<std::string>>;
 
 std::atomic<uint64_t> total_latency_us{0};
 std::atomic<size_t> completed_request_count{0};
@@ -456,10 +472,14 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
                            rte_ring* rx_ring) {
   using namespace boost;
+  namespace net = asio;
   if (unlikely(port_range.first >= port_range.second)) return;
 
   auto ioc = std::make_shared<net::io_context>();
-  std::vector<std::shared_ptr<boost::redis::connection>> conns;
+  std::vector<std::shared_ptr<redis::connection>> conns;
+  std::vector<
+      std::pair<std::shared_ptr<redis::request>, std::vector<rte_mbuf*>>>
+      pipelines;
 
   for (uint i = port_range.first; i <= port_range.second; ++i) {
     boost::redis::config cfg;
@@ -490,33 +510,32 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
         auto db_req = std::make_shared<redis::request>();
 
         if (GET_OP(kv_header->combined) == WRITE_REQUEST) {
-          std::string_view value{kv_header->value1.data(), VALUE_LENGTH * 4};
+          std::string_view value{value_ptr, VALUE_LENGTH * 4};
           db_req->push("SET", key, value);
-
           conn->async_exec(*db_req, redis::ignore, net::detached);
           rte_ring_enqueue((*tx_rings)[req_copy.db_id % TX_CORE_NUM],
                            req_copy.mbuf);
         } else {
           db_req->push("GET", key);
           auto resp = std::make_shared<redis::response<std::string>>();
-
           conn->async_exec(
               *db_req, *resp,
-              [resp, value_ptr, tx_rings, key, req_copy](auto ec, auto) {
-                if (!ec) {
-                  auto& val = std::get<0>(*resp).value();
-                  if (!val.empty()) {
-                    rte_memcpy(value_ptr, val.data(), VALUE_LENGTH * 4);
-                  } else {
-                    RTE_LOG(WARNING, DB, "[DB %d] Not find key: %.*s\n",
-                            req_copy.db_id, KEY_LENGTH, key.data());
-                  }
-                } else {
+              [resp, value_ptr, tx_rings, key, req_copy](
+                  boost::system::error_code ec, std::size_t) {
+                if (ec) {
                   RTE_LOG(ERR, DB, "[DB %d] Redis GET failed: %s\n",
                           req_copy.db_id, ec.message().c_str());
+                  return;
                 }
-                rte_ring_enqueue((*tx_rings)[req_copy.db_id % TX_CORE_NUM],
-                                 req_copy.mbuf);
+                auto& val = std::get<0>(*resp).value();
+                if (!val.empty()) {
+                  rte_memcpy(value_ptr, val.data(), VALUE_LENGTH * 4);
+                  rte_ring_enqueue((*tx_rings)[req_copy.db_id % TX_CORE_NUM],
+                                   req_copy.mbuf);
+                } else {
+                  RTE_LOG(WARNING, DB, "[DB %d] Not find key: %.*s\n",
+                          req_copy.db_id, KEY_LENGTH, key.data());
+                }
               });
         }
       });

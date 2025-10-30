@@ -29,6 +29,7 @@ constexpr int SUBNET_BASE = 0;
 constexpr int SUBNET_COUNT = 32;
 constexpr int HOST_PER_SUBNET = 32;
 
+
 class DPDKHandler {
  public:
   DPDKHandler();
