@@ -512,16 +512,17 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
         if (GET_OP(kv_header->combined) == WRITE_REQUEST) {
           std::string_view value{value_ptr, VALUE_LENGTH * 4};
           db_req->push("SET", key, value);
+          
           conn->async_exec(*db_req, redis::ignore, net::detached);
           rte_ring_enqueue((*tx_rings)[req_copy.db_id % TX_CORE_NUM],
                            req_copy.mbuf);
         } else {
           db_req->push("GET", key);
           auto resp = std::make_shared<redis::response<std::string>>();
+
           conn->async_exec(
               *db_req, *resp,
-              [resp, value_ptr, tx_rings, key, req_copy](
-                  boost::system::error_code ec, std::size_t) {
+              [resp, value_ptr, tx_rings, key, req_copy](auto ec, auto) {
                 if (ec) {
                   RTE_LOG(ERR, DB, "[DB %d] Redis GET failed: %s\n",
                           req_copy.db_id, ec.message().c_str());
