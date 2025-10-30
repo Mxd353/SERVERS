@@ -355,51 +355,6 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
               rte_mempool_put(ipc_mempool_, req);
             }
           }
-
-          // KVHeader *kv_header = reinterpret_cast<KVHeader *>(udp_hdr + 1);
-          // kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
-
-          // uint8_t op = GET_OP(kv_header->combined);
-          // uint8_t is_req = GET_IS_REQ(kv_header->combined);
-
-          // auto value_ptr = kv_header->value1.data();
-          // std::string_view key{kv_header->key.data(), KEY_LENGTH};
-          // req.clear();
-          // if (op == WRITE_REQUEST) {
-          //   std::string_view value{value_ptr, VALUE_LENGTH * 4};
-          //   req.push("SET", key, value);
-          //   db->exec(req, boost::redis::ignore);
-
-          //   if (is_req == WRITE_MIRROR || is_req == CACHE_MIGRATE) {
-          //     if (auto server = GetServerByIp(dst_addr)) {
-          //       KVMigrateHeader *kv_migration_header =
-          //           (KVMigrateHeader *)(kv_header);
-          //       server->CacheMigrate(key, kv_migration_header->migration_id);
-          //     }
-          //     rte_pktmbuf_free(bufs[i]);
-          //     continue;
-          //   }
-          // } else {
-          //   req.push("GET", key);
-          //   resp = {};
-          //   db->exec(req, resp);
-
-          //   auto &val = std::get<0>(resp).value();
-          //   if (val) {
-          //     rte_memcpy(value_ptr, val.value().data(), VALUE_LENGTH * 4);
-          //   } else {
-          //     RTE_LOG(WARNING, DB,
-          //             "[%d.%d.%d.%d] Not find key: %.*s in core: %u\n",
-          //             DECODE_IP(dst_addr), KEY_LENGTH, kv_header->key.data(),
-          //             lcore_id);
-          //   }
-          // }
-
-          // uint16_t nb_tx = rte_eth_tx_burst(port, queue_id, &bufs[i], 1);
-          // if (unlikely(nb_tx < 1)) {
-          //   RTE_LOG(WARNING, DB, "Send error on lcore: %u\n", lcore_id);
-          //   rte_pktmbuf_free(bufs[i]);
-          // }
         }
       }
     }
@@ -472,11 +427,11 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
                            rte_ring* rx_ring) {
   using namespace boost;
-  namespace net = asio;
+  namespace net = boost::asio;
   if (unlikely(port_range.first >= port_range.second)) return;
 
   auto ioc = std::make_shared<net::io_context>();
-  std::vector<std::shared_ptr<redis::connection>> conns;
+  std::vector<std::shared_ptr<boost::redis::connection>> conns;
   std::vector<
       std::pair<std::shared_ptr<redis::request>, std::vector<rte_mbuf*>>>
       pipelines;
@@ -489,6 +444,10 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
     auto conn = std::make_shared<redis::connection>(ioc->get_executor());
     conn->async_run(cfg, {}, net::consign(net::detached, conn));
     conns.push_back(conn);
+
+    auto db_req = std::make_shared<redis::request>();
+    std::vector<rte_mbuf*> burst_mbufs;
+    pipelines.push_back(std::make_pair(db_req, burst_mbufs));
   }
 
   std::thread io_thread([&ioc] { ioc->run(); });
@@ -497,46 +456,54 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
   while (true) {
     if (rte_ring_dequeue(rx_ring, (void**)&req) == 0) {
       auto conn = conns[req->db_id % conns.size()];
+      auto pipeline_ptr = &pipelines[req->db_id % conns.size()];
 
-      net::post(*ioc, [conn, tx_rings = &tx_rings_, req_copy = *req]() {
+      net::post(*ioc, [conn, pipeline_ptr, tx_rings = &tx_rings_,
+                       req_copy = *req]() {
+        auto& pipeline = *pipeline_ptr;
         KVRequest* kv_header = rte_pktmbuf_mtod_offset(
             req_copy.mbuf, KVRequest*, KV_HEADER_OFFSET);
         kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
         // uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
-        auto value_ptr = kv_header->value1.data();
         std::string_view key{kv_header->key.data(), KEY_LENGTH};
 
-        auto db_req = std::make_shared<redis::request>();
-
         if (GET_OP(kv_header->combined) == WRITE_REQUEST) {
-          std::string_view value{value_ptr, VALUE_LENGTH * 4};
-          db_req->push("SET", key, value);
-          
-          conn->async_exec(*db_req, redis::ignore, net::detached);
-          rte_ring_enqueue((*tx_rings)[req_copy.db_id % TX_CORE_NUM],
-                           req_copy.mbuf);
+          std::string_view value{kv_header->value1.data(), VALUE_LENGTH * 4};
+          pipeline.first->push("SET", key, value);
         } else {
-          db_req->push("GET", key);
-          auto resp = std::make_shared<redis::response<std::string>>();
+          pipeline.first->push("GET", key);
+        }
+        pipeline.second.push_back(req_copy.mbuf);
+
+        if (pipeline.first->get_commands() >= BURST_SIZE) {
+          auto pipe_req = std::move(pipeline.first);
+          auto mbufs = std::move(pipeline.second);
+          pipeline.first = std::make_shared<redis::request>();
+          pipeline.second.clear();
+          auto resps = std::make_shared<redis::generic_response>();
 
           conn->async_exec(
-              *db_req, *resp,
-              [resp, value_ptr, tx_rings, key, req_copy](auto ec, auto) {
+              *pipe_req, *resps, [resps, mbufs, tx_rings](auto ec, auto) {
                 if (ec) {
-                  RTE_LOG(ERR, DB, "[DB %d] Redis GET failed: %s\n",
-                          req_copy.db_id, ec.message().c_str());
+                  for (auto m : mbufs) rte_pktmbuf_free(m);
                   return;
                 }
-                auto& val = std::get<0>(*resp).value();
-                if (!val.empty()) {
-                  rte_memcpy(value_ptr, val.data(), VALUE_LENGTH * 4);
-                  rte_ring_enqueue((*tx_rings)[req_copy.db_id % TX_CORE_NUM],
-                                   req_copy.mbuf);
-                } else {
-                  RTE_LOG(WARNING, DB, "[DB %d] Not find key: %.*s\n",
-                          req_copy.db_id, KEY_LENGTH, key.data());
+                for (size_t i = 0; i < resps->value().size(); ++i) {
+                  KVRequest* kv_h = rte_pktmbuf_mtod_offset(
+                      mbufs[i], KVRequest*, KV_HEADER_OFFSET);
+                  if (GET_OP(kv_h->combined) == READ_REQUEST) {
+                    auto& val = resps->value().front().value;
+
+                    rte_memcpy(kv_h->value1.data(), val.data(),
+                               VALUE_LENGTH * 4);
+                  }
+                  redis::consume_one(*resps);
                 }
+                rte_ring_enqueue_bulk(
+                    (*tx_rings)[TX_CORE_NUM],
+                    reinterpret_cast<void* const*>(mbufs.data()), mbufs.size(),
+                    nullptr);
               });
         }
       });
