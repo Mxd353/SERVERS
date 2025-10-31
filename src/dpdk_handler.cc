@@ -18,24 +18,6 @@
 #include "lib/sync_connection.hpp"
 #include "lib/utils.h"
 
-using string_response_32 = boost::redis::response<
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>,
-    std::optional<std::string>, std::optional<std::string>>;
-
 std::atomic<uint64_t> total_latency_us{0};
 std::atomic<size_t> completed_request_count{0};
 
@@ -455,8 +437,9 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
   ipc_req* req = nullptr;
   while (true) {
     if (rte_ring_dequeue(rx_ring, (void**)&req) == 0) {
-      auto conn = conns[req->db_id % conns.size()];
-      auto pipeline_ptr = &pipelines[req->db_id % conns.size()];
+      std::size_t index = req->db_id % conns.size();
+      auto conn = conns[index];
+      auto pipeline_ptr = &pipelines[index];
 
       net::post(*ioc, [conn, pipeline_ptr, tx_rings = &tx_rings_,
                        req_copy = *req]() {
@@ -477,14 +460,14 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
         pipeline.second.push_back(req_copy.mbuf);
 
         if (pipeline.first->get_commands() >= BURST_SIZE) {
-          auto pipe_req = std::move(pipeline.first);
+          auto pipe_reqs = std::move(pipeline.first);
           auto mbufs = std::move(pipeline.second);
           pipeline.first = std::make_shared<redis::request>();
           pipeline.second.clear();
           auto resps = std::make_shared<redis::generic_response>();
 
           conn->async_exec(
-              *pipe_req, *resps, [resps, mbufs, tx_rings](auto ec, auto) {
+              *pipe_reqs, *resps, [resps, mbufs, tx_rings](auto ec, auto) {
                 if (ec) {
                   for (auto m : mbufs) rte_pktmbuf_free(m);
                   return;
