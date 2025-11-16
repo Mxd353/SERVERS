@@ -5,18 +5,24 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
-#define ENCODE_COMBINED(dev_id, is_req, op)                               \
-  (((dev_id & 0xFF) << 8) | ((is_req & 0x0F) << 4) | ((op & 0x03) << 2) | \
-   (0x00 & 0x03))
+#define ENCODE_DEV_INFO(dev_id, dev_type) \
+  (((dev_id & 0x1F) << 5) | ((dev_type & 0x07) << 2))
+
+#define GET_DEV_ID(dev_info) static_cast<uint8_t>(((dev_info) >> 3) & 0x1F)
+#define GET_DEV_TYPE(dev_info) static_cast<uint8_t>((dev_info) & 0x07)
+
+#define ENCODE_COMBINED(is_req, op) \
+  (((is_req & 0x0F) << 4) | ((op & 0x03) << 2) | (0x00 & 0x03))
+
+#define GET_IS_REQ(combined) static_cast<uint8_t>(((combined) >> 4) & 0x0F)
+#define GET_OP(combined) static_cast<uint8_t>(((combined) >> 2) & 0x03)
+#define GET_HOT_QUERY(combined) static_cast<uint8_t>((combined) & 0x03)
+
 #define DECODE_IP(ip) \
   ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF
-
-#define GET_DEV_ID(combined) static_cast<uint8_t>((combined) & 0xFF)
-#define GET_IS_REQ(combined) static_cast<uint8_t>(((combined) >> 12) & 0x0F)
-#define GET_OP(combined) static_cast<uint8_t>(((combined) >> 10) & 0x03)
-#define GET_HOT_QUERY(combined) static_cast<uint8_t>(((combined) >> 8) & 0x03)
 
 #define UDP_PORT_KV 50000
 #define UDP_PORT_MI 50001
@@ -24,6 +30,8 @@
 
 #define KEY_LENGTH 16
 #define VALUE_LENGTH 4
+
+namespace c_m_proto {
 
 constexpr size_t CACHE_SIZE = 310;
 constexpr size_t CHUNK_SIZE = 128;
@@ -51,7 +59,7 @@ constexpr uint8_t MIGRATION_TRANSFER_DONE = 6;
 struct ControllerInfo {
   std::string iface;
   std::string ip;
-  std::array<uint8_t, ETH_ALEN> mac;
+  std::array<uint8_t, RTE_ETHER_ADDR_LEN> mac;
 };
 
 struct SockConfig {
@@ -62,7 +70,7 @@ struct SockConfig {
 #pragma pack(push, 1)
 
 struct KVRequest {
-  uint8_t dev_info;  // DevID_t (5 bits) | DevType_t (3 bits)
+  uint8_t dev_info;  // dev_id (5 bits) | dev_type (3 bits)
   uint32_t request_id = 0;
   uint8_t combined;  // is_req(4 bit) | op(2 bit) | hot_query(2 bit)
   std::array<char, KEY_LENGTH> key{};
@@ -132,3 +140,4 @@ struct PacketTraits<CacheMigrate> {
   static constexpr uint16_t SrcPort = UDP_PORT_CM;
   static constexpr uint16_t DstPort = UDP_PORT_CM;
 };
+}  // namespace c_m_proto

@@ -408,6 +408,7 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 
 void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
                            rte_ring* rx_ring) {
+  using namespace c_m_proto;
   using namespace boost;
   namespace net = boost::asio;
   if (unlikely(port_range.first >= port_range.second)) return;

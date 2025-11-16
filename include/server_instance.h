@@ -28,10 +28,11 @@ class ServerInstance {
     int db;
   };
 
-  ServerInstance(const ServerInfo& server_info,
-                 std::shared_ptr<const SockConfig> sock_config,
-                 std::shared_ptr<const ControllerInfo> controller_info,
-                 std::shared_ptr<const ClusterInfo> clusters_info);
+  ServerInstance(
+      const ServerInfo& server_info,
+      std::shared_ptr<const c_m_proto::SockConfig> sock_config,
+      std::shared_ptr<const c_m_proto::ControllerInfo> controller_info,
+      std::shared_ptr<const ClusterInfo> clusters_info);
   ~ServerInstance();
 
   [[nodiscard]] uint32_t GetIp() const noexcept { return server_ip_in_; }
@@ -43,8 +44,8 @@ class ServerInstance {
 
  private:
   ServerInfo server_info_;
-  std::shared_ptr<const SockConfig> sock_config_;
-  std::shared_ptr<const ControllerInfo> controller_info_;
+  std::shared_ptr<const c_m_proto::SockConfig> sock_config_;
+  std::shared_ptr<const c_m_proto::ControllerInfo> controller_info_;
   std::shared_ptr<const ClusterInfo> clusters_info_;
 
   uint32_t server_ip_in_;
