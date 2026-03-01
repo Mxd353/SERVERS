@@ -86,7 +86,7 @@ class DPDKHandler {
   std::vector<std::unique_ptr<CoreArgs>> core_args_;
 
   static inline void SwapMac(rte_ether_hdr* eth_hdr);
-  static inline void SwapIpv4(rte_ipv4_hdr* ip_hdr);
+  static inline rte_be32_t SwapIpv4(rte_ipv4_hdr* ip_hdr);
   int PortInit();
   void RxLoop(CoreInfo core_info);
   void TxLoop(CoreInfo core_info);

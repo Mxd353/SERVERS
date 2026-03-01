@@ -117,15 +117,16 @@ bool DPDKHandler::Initialize(
 
 inline void DPDKHandler::SwapMac(rte_ether_hdr* eth_hdr) {
   rte_ether_addr tmp_mac;
-  rte_ether_addr_copy(&eth_hdr->src_addr, &tmp_mac);
-  rte_ether_addr_copy(&eth_hdr->dst_addr, &eth_hdr->src_addr);
-  rte_ether_addr_copy(&tmp_mac, &eth_hdr->dst_addr);
+  rte_ether_addr_copy(&eth_hdr->dst_addr, &tmp_mac);
+  rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+  rte_ether_addr_copy(&tmp_mac, &eth_hdr->src_addr);
 }
 
-inline void DPDKHandler::SwapIpv4(rte_ipv4_hdr* ip_hdr) {
-  uint32_t tmp_ip = ip_hdr->src_addr;
-  ip_hdr->src_addr = ip_hdr->dst_addr;
-  ip_hdr->dst_addr = tmp_ip;
+inline rte_be32_t DPDKHandler::SwapIpv4(rte_ipv4_hdr* ip_hdr) {
+  rte_be32_t tmp_ip = ip_hdr->dst_addr;
+  ip_hdr->dst_addr = ip_hdr->src_addr;
+  ip_hdr->src_addr = tmp_ip;
+  return tmp_ip;
 }
 
 int DPDKHandler::PortInit() {
@@ -315,16 +316,14 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           }
 
           SwapMac(eth_hdr);
-          rte_be32_t dst_addr = ip_hdr->dst_addr;
-          ip_hdr->dst_addr = ip_hdr->src_addr;
-          ip_hdr->src_addr = dst_addr;
+          rte_be32_t ip_be = SwapIpv4(ip_hdr);
 
           uint8_t worker_id, db_id;
-          if (LookupWorker(dst_addr, worker_id, db_id) == 0) {
+          if (LookupWorker(ip_be, worker_id, db_id) == 0) {
             rte_pktmbuf_free(rx_pkts[i]);
             RTE_LOG(WARNING, DB,
                     "Not find worker for [%d.%d.%d.%d] in core: %u\n",
-                    DECODE_IP(dst_addr), lcore_id);
+                    DECODE_IP(ip_be), lcore_id);
             continue;
           }
 
