@@ -462,7 +462,7 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
         } else {
           pipeline.first->push("GET", key);
         }
-        
+
         pipeline.second.push_back(req_copy.mbuf);
 
         if (pipeline.first->get_commands() >= BURST_SIZE) {
@@ -489,9 +489,10 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
                                KVRequest* kv_h = rte_pktmbuf_mtod_offset(
                                    mbufs[i], KVRequest*, KV_HEADER_OFFSET);
                                if (GET_OP(kv_h->combined) == READ_REQUEST) {
-                                 auto& entry = vec[i];
-                                 if (entry.value) {
-                                   const std::string& val = *entry.value;
+                                 const std::string& val = vec[i].value;
+
+                                 if (!val.empty()) {
+
                                    rte_memcpy(kv_h->value1.data(), val.data(),
                                               VALUE_LENGTH * 4);
                                  }

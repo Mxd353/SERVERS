@@ -38,7 +38,7 @@ class ServerCluster {
   void StartReceiveThreads(int thread_count);
   void ReceiveThread(
       std::vector<std::shared_ptr<ServerInstance>> servers_subset);
-  inline std::shared_ptr<ServerInstance> GetServerByIp(const rte_be32_t& ip) {
+  inline auto GetServerByIp(rte_be32_t ip) -> std::shared_ptr<ServerInstance> {
     std::shared_lock lock(ip_map_mutex_);
     auto it = ip_to_server_.find(ip);
     return it != ip_to_server_.end() ? it->second : nullptr;

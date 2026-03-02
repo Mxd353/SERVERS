@@ -64,14 +64,16 @@ class ServerInstance {
   // RequestMap<uint32_t, std::promise<bool>> request_map_;
 
   template <typename PayloadType>
-  std::vector<uint8_t> ConstructPacket(std::unique_ptr<PayloadType> payload,
-                                       uint32_t dst_ip, uint32_t src_ip);
+  auto ConstructPacket(std::unique_ptr<PayloadType> payload, uint32_t dst_ip,
+                       uint32_t src_ip) -> std::vector<uint8_t>;
   bool SendPacket(const std::vector<uint8_t>& packet);
   void HandleMigrationInfo(const std::vector<uint8_t>& packet);
-  std::vector<std::pair<std::string, uint>> HashToIps(
-      std::vector<uint> indices, const std::vector<std::string>& ip_list);
-  inline std::vector<uint8_t> ConstructMigratePacket(
-      uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
-      uint8_t dst_rack_id, uint16_t index_size);
+  auto HashToIps(const std::vector<uint32_t>& indices,
+                 const std::vector<std::string>& ip_list)
+      -> std::vector<std::pair<std::string, uint32_t>>;
+  inline auto ConstructMigratePacket(uint32_t dst_ip, uint32_t src_ip,
+                                     uint16_t index, uint32_t migration_id,
+                                     uint8_t dst_rack_id, uint16_t index_size)
+      -> std::vector<uint8_t>;
   void StartMigration(const std::vector<uint8_t>& packet);
 };

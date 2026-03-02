@@ -29,7 +29,6 @@ constexpr int SUBNET_BASE = 0;
 constexpr int SUBNET_COUNT = 32;
 constexpr int HOST_PER_SUBNET = 32;
 
-
 class DPDKHandler {
  public:
   DPDKHandler();
@@ -101,8 +100,8 @@ class DPDKHandler {
   static inline int LaunchRxLcore(void* arg);
   static inline int LaunchTxLcore(void* arg);
 
-  inline std::shared_ptr<ServerInstance> GetServerByIp(const rte_be32_t& ip) {
+  inline auto GetServerByIp(rte_be32_t ip) -> std::shared_ptr<ServerInstance> {
     auto it = ip_to_server_.find(ip);
-    return it != ip_to_server_.end() ? it->second : nullptr;
-  };
+    return (it != ip_to_server_.end()) ? it->second : nullptr;
+  }
 };

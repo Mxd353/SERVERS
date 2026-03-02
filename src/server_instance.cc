@@ -178,8 +178,9 @@ void ServerInstance::HandleMigrationInfo(const std::vector<uint8_t>& packet) {
   }
 }
 
-std::vector<std::pair<std::string, uint>> ServerInstance::HashToIps(
-    std::vector<uint> indices, const std::vector<std::string>& ip_list) {
+auto ServerInstance::HashToIps(const std::vector<uint32_t>& indices,
+                               const std::vector<std::string>& ip_list)
+    -> std::vector<std::pair<std::string, uint32_t>> {
   std::hash<int> hasher;
   std::vector<std::pair<std::string, uint>> result;
   result.reserve(indices.size());
@@ -199,9 +200,9 @@ std::vector<std::pair<std::string, uint>> ServerInstance::HashToIps(
   return result;
 }
 
-inline std::vector<uint8_t> ServerInstance::ConstructMigratePacket(
+inline auto ServerInstance::ConstructMigratePacket(
     uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
-    uint8_t dst_rack_id, uint16_t index_size) {
+    uint8_t dst_rack_id, uint16_t index_size) -> std::vector<uint8_t> {
   size_t payload_size = sizeof(KVMigrate);
   size_t total_size = ETH_HLEN + IPV4_HDR_LEN + UDP_HDR_LEN + payload_size;
   std::vector<uint8_t> packet(total_size);
@@ -238,8 +239,7 @@ inline std::vector<uint8_t> ServerInstance::ConstructMigratePacket(
   struct KVMigrate* kv_migrate = reinterpret_cast<struct KVMigrate*>(
       packet.data() + ETH_HLEN + IPV4_HDR_LEN);
   kv_migrate->request_id = utils::generate_request_id();
-  uint16_t combined =
-      ENCODE_COMBINED(CACHE_MIGRATE, WRITE_REQUEST);
+  uint16_t combined = ENCODE_COMBINED(CACHE_MIGRATE, WRITE_REQUEST);
   kv_migrate->combined = htons(combined);
   kv_migrate->migration_id = migration_id;
   kv_migrate->src_rack_id = server_info_.rack_id;
@@ -264,10 +264,8 @@ void ServerInstance::StartMigration(const std::vector<uint8_t>& packet) {
 
   const auto& dst_cluster = (*clusters_info_)[migration_info_hdr->dst_rack_id];
 
-  std::vector<uint> indices =
-      utils::SampleIndices(index_base_, index_limit_, CHUNK_SIZE);
-
-  auto index_to_ips = HashToIps(indices, dst_cluster);
+  auto index_to_ips = HashToIps(
+      utils::SampleIndices(index_base_, index_limit_, CHUNK_SIZE), dst_cluster);
 
   for (const auto& it : index_to_ips) {
     std::vector<uint8_t> c_mpacket = ConstructMigratePacket(
