@@ -42,7 +42,7 @@ void signalHandler(int signal) {
 void parseClusterInfo(const std::string& server_conf,
                       const std::string& controller_conf,
                       std::vector<std::vector<std::string>>& racks,
-                      ControllerInfo& controller_info) {
+                      c_m_proto::ControllerInfo& controller_info) {
   std::ifstream server_file(server_conf);
   std::ifstream controller_file(controller_conf);
   std::string line;
@@ -98,7 +98,7 @@ int main(int argc, char* argv[]) {
   std::string controller_conf = "conf/controller_info.conf";
 
   std::vector<std::vector<std::string>> racks;
-  ControllerInfo controller_info;
+  c_m_proto::ControllerInfo controller_info;
 
   parseClusterInfo(server_conf, controller_conf, racks, controller_info);
   if (racks.empty()) {

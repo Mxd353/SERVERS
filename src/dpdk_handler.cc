@@ -18,15 +18,17 @@
 #include "lib/sync_connection.hpp"
 #include "lib/utils.h"
 
+namespace redis = boost::redis;
+
 std::atomic<uint64_t> total_latency_us{0};
 std::atomic<size_t> completed_request_count{0};
 
 std::ofstream outfile("server.output");
 
-inline void redis_test(boost::redis::sync_connection& conn) {
+inline void redis_test(redis::sync_connection& conn) {
   try {
-    boost::redis::request req;
-    boost::redis::response<std::string> resp;
+    redis::request req;
+    redis::response<std::string> resp;
 
     req.push("PING");
 
@@ -392,7 +394,7 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
     //     delete packet_data;
     //     int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
     //     if (ret < 1) {
-    //       RTE_LOG(ERR, CORE, "Send error: %s (errno=%d)\n",
+    //       RTE_LOG(ERR, CORE, "Send error: %s (errno=%d)\n", 
     //       rte_strerror(-ret),
     //               -ret);
     //       rte_pktmbuf_free(mbuf);
@@ -408,18 +410,18 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
                            rte_ring* rx_ring) {
   using namespace c_m_proto;
-  using namespace boost;
   namespace net = boost::asio;
+
   if (unlikely(port_range.first >= port_range.second)) return;
 
   auto ioc = std::make_shared<net::io_context>();
-  std::vector<std::shared_ptr<boost::redis::connection>> conns;
+  std::vector<std::shared_ptr<redis::connection>> conns;
   std::vector<
       std::pair<std::shared_ptr<redis::request>, std::vector<rte_mbuf*>>>
       pipelines;
 
   for (uint i = port_range.first; i <= port_range.second; ++i) {
-    boost::redis::config cfg;
+    redis::config cfg;
     cfg.addr.host = "127.0.0.1";
     cfg.addr.port = std::to_string(i);
 
