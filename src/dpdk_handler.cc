@@ -606,23 +606,22 @@ inline void DPDKHandler::InitAndLaunchCores() {
 
   RTE_LCORE_FOREACH_WORKER(lcore_id) {
     if (core_counter < RX_CORE_NUM) {
-      rx_cores_.emplace_back(lcore_id, CoreType::RX_CORE, &rx_rings_);
+      all_cores_.emplace_back(lcore_id, CoreType::RX_CORE, &rx_rings_);
     } else if (core_counter < RX_CORE_NUM + WORKER_CORE_NUM) {
       uint q_idx = core_counter - RX_CORE_NUM;
+      uint tx_idx = (TX_CORE_NUM > 0) ? (q_idx % TX_CORE_NUM) : 0;
       if (q_idx >= RX_CORE_NUM) break;
 
       std::pair<rte_ring*, rte_ring*> pair = {rx_rings_[q_idx],
-                                              tx_rings_[q_idx % TX_CORE_NUM]};
-      worker_cores_.emplace_back(lcore_id, CoreType::WORKER_CORE, nullptr,
-                                 pair);
+                                              tx_rings_[tx_idx]};
+      all_cores_.emplace_back(lcore_id, CoreType::WORKER_CORE, nullptr, pair);
     } else {
       uint q_idx = core_counter - (RX_CORE_NUM + WORKER_CORE_NUM);
-      if (q_idx >= RX_CORE_NUM) {
-        break;
-      }
-      tx_cores_.emplace_back(lcore_id, CoreType::TX_CORE, nullptr,
-                             std::make_pair(nullptr, nullptr),
-                             tx_rings_[q_idx]);
+      if (q_idx >= TX_CORE_NUM) break;
+
+      all_cores_.emplace_back(lcore_id, CoreType::TX_CORE, nullptr,
+                              std::make_pair(nullptr, nullptr),
+                              tx_rings_[q_idx]);
     }
     core_counter++;
     if (core_counter >= TOTAL_CORE_NUM) break;
@@ -707,36 +706,7 @@ void DPDKHandler::Start() {
     }
   }
 
-  uint lcore_id;
-  uint core_counter = 0;
-
-  rx_cores_.reserve(RX_CORE_NUM);
-  worker_cores_.reserve(WORKER_CORE_NUM);
-  tx_cores_.reserve(TX_CORE_NUM);
-
-  RTE_LCORE_FOREACH_WORKER(lcore_id) {
-    if (core_counter < RX_CORE_NUM) {
-      rx_cores_.emplace_back(lcore_id, CoreType::RX_CORE, &rx_rings_);
-    } else if (core_counter < RX_CORE_NUM + WORKER_CORE_NUM) {
-      uint q_idx = core_counter - RX_CORE_NUM;
-      if (q_idx >= RX_CORE_NUM) break;
-
-      std::pair<rte_ring*, rte_ring*> pair = {rx_rings_[q_idx],
-                                              tx_rings_[q_idx % TX_CORE_NUM]};
-      worker_cores_.emplace_back(lcore_id, CoreType::WORKER_CORE, nullptr,
-                                 pair);
-    } else {
-      uint q_idx = core_counter - (RX_CORE_NUM + WORKER_CORE_NUM);
-      if (q_idx >= RX_CORE_NUM) {
-        break;
-      }
-      tx_cores_.emplace_back(lcore_id, CoreType::TX_CORE, nullptr,
-                             std::make_pair(nullptr, nullptr),
-                             tx_rings_[q_idx]);
-    }
-    core_counter++;
-    if (core_counter >= TOTAL_CORE_NUM) break;
-  }
+  InitAndLaunchCores();
 
   // creat pool
   tx_mbufpool_ = rte_pktmbuf_pool_create(
