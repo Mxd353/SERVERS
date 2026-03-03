@@ -8,7 +8,6 @@
 
 #include "server_instance.h"
 
-#define RING_SIZE 1024
 #define RTE_LOGTYPE_RING RTE_LOGTYPE_USER1
 #define RTE_LOGTYPE_DB RTE_LOGTYPE_USER2
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
@@ -21,10 +20,13 @@
 #define RX_RING_SIZE 2048
 #define TX_RING_SIZE 1024
 #define SAFETY_FACTOR 1.5
-#define WORKER_NUM 32
-#define RX_CORE_NUM 8
-#define TX_CORE_NUM 2
 
+constexpr uint32_t RX_CORE_NUM = 8;
+constexpr uint32_t WORKER_CORE_NUM = RX_CORE_NUM;
+constexpr uint32_t TX_CORE_NUM = 2;
+constexpr uint32_t TOTAL_CORE_NUM = RX_CORE_NUM + WORKER_CORE_NUM + TX_CORE_NUM;
+constexpr uint32_t NUM_RACKS = 32;
+constexpr uint32_t RING_SIZE = 262144;
 constexpr int SUBNET_BASE = 0;
 constexpr int SUBNET_COUNT = 32;
 constexpr int HOST_PER_SUBNET = 32;
@@ -51,29 +53,38 @@ class DPDKHandler {
   rte_ether_addr s_eth_addr_;
   std::shared_mutex ip_map_mutex_;
   std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>> ip_to_server_;
-  std::array<rte_ring*, WORKER_NUM> rx_rings_;
+  std::array<rte_ring*, RX_CORE_NUM> rx_rings_;
   std::array<rte_ring*, TX_CORE_NUM> tx_rings_;
 
-  enum class CoreType { Rx, Tx, NONE };
+  enum class CoreType { RX_CORE, WORKER_CORE, TX_CORE, NONE };
 
   struct CoreInfo {
     uint lcore_id;
     uint16_t queue_id;
     CoreType type;
-    std::array<rte_ring*, WORKER_NUM>* rx_rings;
+    std::array<rte_ring*, RX_CORE_NUM>* rx_rings;
+    std::pair<rte_ring*, rte_ring*> work_rings;
     rte_ring* tx_ring;
 
     CoreInfo(uint l = 0, CoreType t = CoreType::NONE,
-             std::array<rte_ring*, WORKER_NUM>* rxrs = nullptr,
+             std::array<rte_ring*, RX_CORE_NUM>* rxrs = nullptr,
+             std::pair<rte_ring*, rte_ring*> wr = {nullptr, nullptr},
              rte_ring* txr = nullptr)
-        : lcore_id(l), queue_id(0), type(t), rx_rings(rxrs), tx_ring(txr) {}
+        : lcore_id(l),
+          queue_id(0),
+          type(t),
+          rx_rings(rxrs),
+          work_rings(wr),
+          tx_ring(txr) {}
   };
 
   std::vector<CoreInfo> rx_cores_;
+  std::vector<CoreInfo> worker_cores_;
   std::vector<CoreInfo> tx_cores_;
+  std::vector<CoreInfo> all_cores_;
 
   struct CoreArgs {
-    CoreInfo core_info;
+    const CoreInfo* core_info;
     DPDKHandler* instance;
   };
 
@@ -94,11 +105,12 @@ class DPDKHandler {
   inline void BuildIptoServerMap(
       const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
           servers);
-  inline void LaunchThreads(
-      const std::vector<DPDKHandler::CoreInfo>& rx_cores_,
-      const std::vector<DPDKHandler::CoreInfo>& tx_cores_);
+
+  inline void InitAndLaunchCores();
+  inline void LaunchThreads();
   static inline int LaunchRxLcore(void* arg);
   static inline int LaunchTxLcore(void* arg);
+  static inline int LaunchWorkerLcore(void* arg);
 
   inline auto GetServerByIp(rte_be32_t ip) -> std::shared_ptr<ServerInstance> {
     auto it = ip_to_server_.find(ip);

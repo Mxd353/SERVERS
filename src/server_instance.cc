@@ -76,8 +76,9 @@ void ServerInstance::CacheMigrate(const std::string_view& key,
 }
 
 template <typename PayloadType>
-std::vector<uint8_t> ServerInstance::ConstructPacket(
-    std::unique_ptr<PayloadType> payload, uint32_t dst_ip, uint32_t src_ip) {
+auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
+                                     uint32_t dst_ip, uint32_t src_ip)
+    -> std::vector<uint8_t> {
   if (!payload) {
     throw std::invalid_argument("Payload cannot be null");
   }

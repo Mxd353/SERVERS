@@ -92,7 +92,7 @@ void parseClusterInfo(const std::string& server_conf,
   }
 }
 
-int main(int argc, char* argv[]) {
+auto main(int argc, char* argv[]) -> int {
   (void)argc;
   std::string server_conf = "conf/server_ips.conf";
   std::string controller_conf = "conf/controller_info.conf";
