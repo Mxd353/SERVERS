@@ -27,11 +27,12 @@ constexpr uint32_t TX_CORE_NUM = 2;
 constexpr uint32_t TOTAL_CORE_NUM = RX_CORE_NUM + WORKER_CORE_NUM + TX_CORE_NUM;
 constexpr uint32_t NUM_RACKS = 32;
 constexpr uint32_t RING_SIZE = 262144;
-constexpr int RACK_PER_WORKER = NUM_RACKS / WORKER_CORE_NUM;
-constexpr int SUBNET_BASE = 0;
-constexpr int SUBNET_COUNT = 32;
-constexpr int HOST_PER_SUBNET = 32;
+constexpr uint32_t RACK_PER_WORKER = NUM_RACKS / WORKER_CORE_NUM;
+constexpr uint32_t DB_PER_RACK = 32;
+constexpr uint32_t TOTAL_DB_NUM = DB_PER_RACK * NUM_RACKS;
+constexpr uint32_t DBS_PER_WORKER = TOTAL_DB_NUM / WORKER_CORE_NUM;
 
+std::atomic<uint32_t> next_db_id{0};
 static std::array<uint8_t, NUM_RACKS> worker_table;
 
 class DPDKHandler {
@@ -100,12 +101,12 @@ class DPDKHandler {
   int PortInit();
   void RxLoop(CoreInfo core_info);
   void TxLoop(CoreInfo core_info);
-  void DBWorker(std::pair<uint, uint> port_range, rte_ring* rx_ring);
+  void DBWorker(CoreInfo core_info);
 
   inline void BuildIptoServerMap(
       const std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>>&
           servers);
-
+  inline void CreatRings();
   inline void InitAndLaunchCores();
   inline void CreatPool();
   static inline int LaunchRxLcore(void* arg);

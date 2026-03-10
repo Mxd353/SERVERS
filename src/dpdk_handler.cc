@@ -20,12 +20,16 @@
 #include "lib/utils.h"
 
 /**
-RX lcore (DPDK)
+RX lcore
       ↓
-per-rack SPSC ring
+per-rack RTSSC ring
       ↓
-Worker + TX lcore
+Worker lcore
+      ↓
+TX lcore
 */
+
+// 10.0.<rack>.<host>
 
 namespace redis = boost::redis;
 
@@ -265,22 +269,9 @@ int DPDKHandler::PortInit() {
   return 0;
 }
 
-inline void BuildIptoDBMapFlat(
-    std::shared_ptr<boost::redis::sync_connection> ip_to_db_flat[]) {
-  int base_port = 6380;
-  for (int subnet = 0; subnet < SUBNET_COUNT; ++subnet) {
-    for (int host = 1; host <= HOST_PER_SUBNET; ++host) {
-      int index = subnet * HOST_PER_SUBNET + (host - 1);
-
-      boost::redis::config cfg;
-      cfg.addr.host = "127.0.0.1";
-      cfg.addr.port = index + base_port;
-      auto conn = std::make_shared<boost::redis::sync_connection>();
-      conn->run(cfg);
-
-      redis_test(*conn);
-      ip_to_db_flat[index] = conn;
-    }
+inline void InitLookupTables() {
+  for (auto rack = 0; rack < NUM_RACKS; ++rack) {
+    worker_table[rack] = rack / RACK_PER_WORKER;
   }
 }
 
@@ -288,11 +279,16 @@ inline int LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
                         uint8_t& db_out) {
   uint32_t ip = rte_be_to_cpu_32(ip_be);
 
-  uint8_t rack = ip >> 8;
-  uint8_t host = ip;
+  uint8_t rack = static_cast<uint8_t>((ip >> 8) & 0xFF);  // subnet
+  uint8_t host = static_cast<uint8_t>(ip & 0xFF);         // host
+
+  if (unlikely(rack >= worker_table.size() || host == 0 || host > DB_PER_RACK))
+    return -1;
 
   worker_out = worker_table[rack];
-  db_out = host;
+  db_out = rack * DB_PER_RACK + (host - 1);
+
+  if (unlikely(worker_out == 0xFF || db_out >= TOTAL_DB_NUM)) return -1;
 
   return 0;
 }
@@ -436,12 +432,25 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
   }
 }
 
-void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
-                           rte_ring* rx_ring) {
+void DPDKHandler::DBWorker(CoreInfo core_info) {
   using namespace c_m_proto;
   namespace net = boost::asio;
 
-  if (unlikely(port_range.first >= port_range.second)) return;
+  thread_local uint lcore_id = core_info.lcore_id;
+  thread_local auto* rx_ring = core_info.work_rings.first;
+  thread_local auto* tx_ring = core_info.work_rings.second;
+
+  uint32_t start_db = next_db_id.fetch_add(DBS_PER_WORKER);
+  uint32_t end_db = start_db + DBS_PER_WORKER - 1;
+
+  if (start_db >= TOTAL_DB_NUM) {
+    std::cerr << "Worker lcore " << lcore_id << " has no DB to handle.\n";
+    return;
+  }
+  if (end_db >= TOTAL_DB_NUM) end_db = TOTAL_DB_NUM - 1;
+
+  std::cout << "Worker lcore " << lcore_id << " handles DBs: " << start_db
+            << " ~ " << end_db << std::endl;
 
   auto ioc = std::make_shared<net::io_context>();
   std::vector<std::shared_ptr<redis::connection>> conns;
@@ -449,10 +458,10 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
       std::pair<std::shared_ptr<redis::request>, std::vector<rte_mbuf*>>>
       pipelines;
 
-  for (uint i = port_range.first; i <= port_range.second; ++i) {
+  for (auto port = start_db; port <= end_db; ++port) {
     redis::config cfg;
     cfg.addr.host = "127.0.0.1";
-    cfg.addr.port = std::to_string(i);
+    cfg.addr.port = std::to_string(port);
 
     auto conn = std::make_shared<redis::connection>(ioc->get_executor());
     conn->async_run(cfg, {}, net::consign(net::detached, conn));
@@ -543,11 +552,33 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
   io_thread.join();
 }
 
+inline void DPDKHandler::CreatRings() {
+  for (int i = 0; i < RX_CORE_NUM; i++) {
+    char ring_name[32];
+    snprintf(ring_name, sizeof(ring_name), "rx_ring_%d", i);
+    rx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
+                                   RING_F_MP_RTS_ENQ | RING_F_SC_DEQ);
+    if (rx_rings_[i] == nullptr) {
+      rte_exit(EXIT_FAILURE, "Failed to create ring %s\n", ring_name);
+    }
+  }
+
+  for (int i = 0; i < TX_CORE_NUM; i++) {
+    char ring_name[32];
+    snprintf(ring_name, sizeof(ring_name), "tx_ring_%d", i);
+    tx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
+                                   RING_F_MP_RTS_ENQ | RING_F_SC_DEQ);
+    if (tx_rings_[i] == nullptr) {
+      rte_exit(EXIT_FAILURE, "Failed to create ring %s\n", ring_name);
+    }
+  }
+}
+
 inline void DPDKHandler::InitAndLaunchCores() {
+  all_cores_.reserve(TOTAL_CORE_NUM);
+
   uint core_counter = 0;
   uint lcore_id;
-
-  all_cores_.reserve(TOTAL_CORE_NUM);
 
   RTE_LCORE_FOREACH_WORKER(lcore_id) {
     if (core_counter < RX_CORE_NUM) {
@@ -669,25 +700,7 @@ inline void DPDKHandler::LaunchThreads() {
 void DPDKHandler::Start() {
   uint16_t port = 0;
 
-  for (int i = 0; i < RX_CORE_NUM; i++) {
-    char ring_name[32];
-    snprintf(ring_name, sizeof(ring_name), "rx_ring_%d", i);
-    rx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
-                                   RING_F_MP_RTS_ENQ | RING_F_SC_DEQ);
-    if (rx_rings_[i] == nullptr) {
-      rte_exit(EXIT_FAILURE, "Failed to create ring %s\n", ring_name);
-    }
-  }
-
-  for (int i = 0; i < TX_CORE_NUM; i++) {
-    char ring_name[32];
-    snprintf(ring_name, sizeof(ring_name), "tx_ring_%d", i);
-    tx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
-                                   RING_F_MP_RTS_ENQ | RING_F_SC_DEQ);
-    if (tx_rings_[i] == nullptr) {
-      rte_exit(EXIT_FAILURE, "Failed to create ring %s\n", ring_name);
-    }
-  }
+  InitLookupTables();
 
   InitAndLaunchCores();
 
