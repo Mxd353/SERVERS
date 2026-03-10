@@ -27,9 +27,12 @@ constexpr uint32_t TX_CORE_NUM = 2;
 constexpr uint32_t TOTAL_CORE_NUM = RX_CORE_NUM + WORKER_CORE_NUM + TX_CORE_NUM;
 constexpr uint32_t NUM_RACKS = 32;
 constexpr uint32_t RING_SIZE = 262144;
+constexpr int RACK_PER_WORKER = NUM_RACKS / WORKER_CORE_NUM;
 constexpr int SUBNET_BASE = 0;
 constexpr int SUBNET_COUNT = 32;
 constexpr int HOST_PER_SUBNET = 32;
+
+static std::array<uint8_t, NUM_RACKS> worker_table;
 
 class DPDKHandler {
  public:
@@ -78,9 +81,6 @@ class DPDKHandler {
           tx_ring(txr) {}
   };
 
-  std::vector<CoreInfo> rx_cores_;
-  std::vector<CoreInfo> worker_cores_;
-  std::vector<CoreInfo> tx_cores_;
   std::vector<CoreInfo> all_cores_;
 
   struct CoreArgs {
@@ -107,10 +107,11 @@ class DPDKHandler {
           servers);
 
   inline void InitAndLaunchCores();
-  inline void LaunchThreads();
+  inline void CreatPool();
   static inline int LaunchRxLcore(void* arg);
   static inline int LaunchTxLcore(void* arg);
   static inline int LaunchWorkerLcore(void* arg);
+  inline void LaunchThreads();
 
   inline auto GetServerByIp(rte_be32_t ip) -> std::shared_ptr<ServerInstance> {
     auto it = ip_to_server_.find(ip);

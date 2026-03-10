@@ -243,33 +243,6 @@ int DPDKHandler::PortInit() {
     return -1;
   }
 
-  // for (uint16_t q = 0; q < nb_rx_cores; q++) {
-  //   assert(all_cores_[q].type == CoreType::RX_CORE);
-
-  //   retval = rte_eth_rx_queue_setup(
-  //       port, q, rx_ring_size, rte_eth_dev_socket_id(port), NULL,
-  //       rx_mbufpool_);
-
-  //   if (retval < 0) return retval;
-
-  //   all_cores_[q].queue_id = q;
-  // }
-
-  // for (uint16_t q = 0; q < nb_tx_cores; q++) {
-  //   uint16_t tx_start_index = all_cores_.size() - nb_tx_cores;
-  //   uint16_t actual_index = tx_start_index + q;
-
-  //   assert(actual_index < all_cores_.size());
-  //   assert(all_cores_[actual_index].type == CoreType::TX_CORE);
-
-  //   retval = rte_eth_tx_queue_setup(port, q, tx_ring_size,
-  //                                   rte_eth_dev_socket_id(port), &txconf);
-
-  //   if (retval < 0) return retval;
-
-  //   all_cores_[actual_index].queue_id = q;
-  // }
-
   /* Starting Ethernet port. 8< */
   retval = rte_eth_dev_start(port);
   if (retval < 0) return retval;
@@ -311,30 +284,15 @@ inline void BuildIptoDBMapFlat(
   }
 }
 
-inline int LookupWorker(rte_be32_t ip_be, uint8_t& subnet_out,
-                        uint8_t& host_out) {
-  const uint32_t ip = rte_be_to_cpu_32(ip_be);
-  const uint8_t a = static_cast<uint8_t>((ip >> 24) & 0xFF);
-  const uint8_t b = static_cast<uint8_t>((ip >> 16) & 0xFF);
+inline int LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
+                        uint8_t& db_out) {
+  uint32_t ip = rte_be_to_cpu_32(ip_be);
 
-  if (unlikely(a != 10 || b != 0)) {
-    return -1;
-  }
+  uint8_t rack = ip >> 8;
+  uint8_t host = ip;
 
-  const uint8_t subnet = static_cast<uint8_t>((ip >> 8) & 0xFF);
-  const uint8_t host = static_cast<uint8_t>(ip & 0xFF);
-
-  if (unlikely(subnet < SUBNET_BASE ||
-               subnet >= (SUBNET_BASE + SUBNET_COUNT))) {
-    return -1;
-  }
-
-  if (unlikely(host == 0 || host > HOST_PER_SUBNET)) {
-    return -1;
-  }
-
-  subnet_out = subnet;
-  host_out = host;
+  worker_out = worker_table[rack];
+  db_out = host;
 
   return 0;
 }
@@ -585,19 +543,6 @@ void DPDKHandler::DBWorker(std::pair<uint, uint> port_range,
   io_thread.join();
 }
 
-inline int DPDKHandler::LaunchRxLcore(void* arg) {
-  CoreArgs* args = static_cast<CoreArgs*>(arg);
-  args->instance->RxLoop(args->core_info);
-  return 0;
-}
-
-inline int DPDKHandler::LaunchTxLcore(void* arg) {
-  CoreArgs* args = static_cast<CoreArgs*>(arg);
-  (void)args;
-  args->instance->TxLoop(args->core_info);
-  return 0;
-}
-
 inline void DPDKHandler::InitAndLaunchCores() {
   uint core_counter = 0;
   uint lcore_id;
@@ -628,53 +573,92 @@ inline void DPDKHandler::InitAndLaunchCores() {
   }
 }
 
+inline void DPDKHandler::CreatPool() {
+  uint nb_ports = rte_eth_dev_count_avail();
+
+  tx_mbufpool_ = rte_pktmbuf_pool_create(
+      "TX_MBUF_POOL", TX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
+      TX_MBUF_DATA_SIZE, rte_socket_id());
+  if (tx_mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create tx mbuf pool\n");
+
+  rx_mbufpool_ = rte_pktmbuf_pool_create(
+      "RX_MBUF_POOL", RX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
+      RX_MBUF_DATA_SIZE, rte_socket_id());
+  if (rx_mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create rx mbuf pool\n");
+
+  ipc_mempool_ = rte_mempool_create("ipc_req_pool", 8191, sizeof(ipc_req), 0, 0,
+                                    NULL, NULL, NULL, NULL, rte_socket_id(), 0);
+  if (ipc_mempool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create ipc mbuf pool\n");
+}
+
+inline int DPDKHandler::LaunchRxLcore(void* arg) {
+  CoreArgs* args = static_cast<CoreArgs*>(arg);
+  args->instance->RxLoop(*args->core_info);
+  return 0;
+}
+
+inline int DPDKHandler::LaunchTxLcore(void* arg) {
+  CoreArgs* args = static_cast<CoreArgs*>(arg);
+  (void)args;
+  args->instance->TxLoop(*args->core_info);
+  return 0;
+}
+
+inline int DPDKHandler::LaunchWorkerLcore(void* arg) {
+  CoreArgs* args = static_cast<CoreArgs*>(arg);
+  (void)args;
+  args->instance->DBWorker(*args->core_info);
+  return 0;
+}
+
 inline void DPDKHandler::LaunchThreads() {
   core_args_.reserve(TOTAL_CORE_NUM);
 
-  for (const auto& lcore : rx_cores_) {
+  for (const auto& lcore : all_cores_) {
     auto args = std::make_unique<CoreArgs>();
     args->instance = this;
     args->core_info = &lcore;
+    auto type = args->core_info->type;
 
     core_args_.push_back(std::move(args));
 
-    int ret = rte_eal_remote_launch(LaunchRxLcore, core_args_.back().get(),
-                                    lcore.lcore_id);
-    if (ret < 0) {
-      std::cerr << "Failed to launch rx thread on core " << lcore.lcore_id
-                << ", error: " << rte_strerror(-ret) << std::endl;
-      return;
+    int ret = -1;
+    const char* core_name = nullptr;
+
+    switch (type) {
+      case CoreType::RX_CORE: {
+        int ret = rte_eal_remote_launch(LaunchRxLcore, core_args_.back().get(),
+                                        lcore.lcore_id);
+        core_name = "rx";
+        break;
+      }
+
+      case CoreType::WORKER_CORE: {
+        int ret = rte_eal_remote_launch(
+            LaunchWorkerLcore, core_args_.back().get(), lcore.lcore_id);
+        core_name = "worker";
+        break;
+      }
+
+      case CoreType::TX_CORE: {
+        int ret = rte_eal_remote_launch(LaunchTxLcore, core_args_.back().get(),
+                                        lcore.lcore_id);
+        core_name = "tx";
+        break;
+      }
+
+      default:
+        std::cerr << "Unknown core type on lcore " << lcore.lcore_id
+                  << std::endl;
+        continue;
     }
-  }
-
-  for (const auto& lcore : worker_cores_) {
-    auto args = std::make_unique<CoreArgs>();
-    args->instance = this;
-    args->core_info = &lcore;
-
-    core_args_.push_back(std::move(args));
-
-    int ret = rte_eal_remote_launch(LaunchWorkerLcore, core_args_.back().get(),
-                                    lcore.lcore_id);
     if (ret < 0) {
-      std::cerr << "Failed to launch tx thread on core " << lcore.lcore_id
-                << ", error: " << rte_strerror(-ret) << std::endl;
-      return;
-    }
-  }
-
-  for (const auto& lcore : tx_cores_) {
-    auto args = std::make_unique<CoreArgs>();
-    args->instance = this;
-    args->core_info = &lcore;
-
-    core_args_.push_back(std::move(args));
-
-    int ret = rte_eal_remote_launch(LaunchTxLcore, core_args_.back().get(),
-                                    lcore.lcore_id);
-    if (ret < 0) {
-      std::cerr << "Failed to launch tx thread on core " << lcore.lcore_id
-                << ", error: " << rte_strerror(-ret) << std::endl;
+      std::cerr << "Failed to launch " << core_name << " thread on core "
+                << lcore.lcore_id << ", error: " << rte_strerror(-ret)
+                << std::endl;
       return;
     }
   }
@@ -684,7 +668,6 @@ inline void DPDKHandler::LaunchThreads() {
 
 void DPDKHandler::Start() {
   uint16_t port = 0;
-  uint nb_ports = rte_eth_dev_count_avail();
 
   for (int i = 0; i < RX_CORE_NUM; i++) {
     char ring_name[32];
@@ -708,23 +691,7 @@ void DPDKHandler::Start() {
 
   InitAndLaunchCores();
 
-  // creat pool
-  tx_mbufpool_ = rte_pktmbuf_pool_create(
-      "TX_MBUF_POOL", TX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
-      TX_MBUF_DATA_SIZE, rte_socket_id());
-  if (tx_mbufpool_ == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create tx mbuf pool\n");
-
-  rx_mbufpool_ = rte_pktmbuf_pool_create(
-      "RX_MBUF_POOL", RX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
-      RX_MBUF_DATA_SIZE, rte_socket_id());
-  if (rx_mbufpool_ == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create rx mbuf pool\n");
-
-  ipc_mempool_ = rte_mempool_create("ipc_req_pool", 8191, sizeof(ipc_req), 0, 0,
-                                    NULL, NULL, NULL, NULL, rte_socket_id(), 0);
-  if (ipc_mempool_ == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create ipc mbuf pool\n");
+  CreatPool();
 
   // set mac address
   rte_ether_unformat_addr("aa:bb:cc:dd:ee:ff", &s_eth_addr_);
@@ -739,11 +706,14 @@ void DPDKHandler::Start() {
   while (true) {
     utils::monitor_mempool(rx_mbufpool_);
     utils::monitor_mempool(tx_mbufpool_);
-    for (size_t i = 0; i < rx_cores_.size(); ++i)
+
+    for (size_t i = 0; i < RX_CORE_NUM; ++i)
       std::cout << rte_eth_rx_queue_count(port, i) << " | ";
     std::cout << std::endl;
+
     rte_delay_us_sleep(1000'000);
   }
+
   rte_eal_mp_wait_lcore();
 }
 
