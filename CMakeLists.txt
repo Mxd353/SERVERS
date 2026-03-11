@@ -53,6 +53,7 @@ add_executable(${TARGET_NAME}
 target_compile_definitions(${TARGET_NAME}
     PRIVATE
         RTE_LIBRTE_ETHDEV_DEBUG
+        BOOST_REDIS_SEPARATE_COMPILATION
 )
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
