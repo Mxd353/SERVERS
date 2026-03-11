@@ -264,9 +264,9 @@ inline int DPDKHandler::LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
 void DPDKHandler::RxLoop(CoreInfo core_info) {
   const uint16_t port = 0;
 
-  thread_local uint lcore_id = core_info.lcore_id;
-  thread_local uint16_t queue_id = core_info.queue_id;
-  thread_local auto rx_rings = core_info.rx_rings;
+  uint lcore_id = core_info.lcore_id;
+  uint16_t queue_id = core_info.queue_id;
+  auto rx_rings = core_info.rx_rings;
 
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
     rte_exit(EXIT_FAILURE, "Invalid lcore_id=%u\n", lcore_id);
@@ -286,16 +286,19 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
     rte_mbuf* rx_pkts[BURST_SIZE];
     while (true) {
       uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, rx_pkts, BURST_SIZE);
-      if (unlikely(nb_rx <= 0)) {
+      if (unlikely(nb_rx == 0)) {
         rte_pause();
         continue;
       } else {
         for (uint16_t i = 0; i < nb_rx; i++) {
-          if (i + 1 < nb_rx)
-            rte_prefetch0(rte_pktmbuf_mtod(rx_pkts[i + 1], void*));
+          if (i + 2 < nb_rx)
+            rte_prefetch0(rte_pktmbuf_mtod(rx_pkts[i + 2], void*));
 
-          rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(rx_pkts[i], rte_ether_hdr*);
+          auto* mbuf = rx_pkts[i];
+          auto* eth_hdr = rte_pktmbuf_mtod(mbuf, rte_ether_hdr*);
+
           rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
+
           if (unlikely(ip_hdr->next_proto_id != IPPROTO_UDP)) {
             rte_pktmbuf_free(rx_pkts[i]);
             continue;
@@ -314,7 +317,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           rte_be32_t ip_be = SwapIpv4(ip_hdr);
 
           uint8_t worker_id, db_id;
-          if (LookupWorker(ip_be, worker_id, db_id) == 0) {
+          if (LookupWorker(ip_be, worker_id, db_id) != 0) {
             rte_pktmbuf_free(rx_pkts[i]);
             RTE_LOG(WARNING, DB,
                     "Not find worker for [%d.%d.%d.%d] in core: %u\n",
