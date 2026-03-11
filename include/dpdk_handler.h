@@ -6,6 +6,9 @@
 #include <rte_ip4.h>
 #include <rte_mbuf.h>
 
+#include <boost/asio.hpp>
+#include <boost/redis/src.hpp>
+
 #include "server_instance.h"
 
 #define RTE_LOGTYPE_RING RTE_LOGTYPE_USER1
@@ -34,8 +37,7 @@ constexpr uint32_t DB_PER_RACK = 32;
 constexpr uint32_t TOTAL_DB_NUM = DB_PER_RACK * NUM_RACKS;
 constexpr uint32_t DBS_PER_WORKER = TOTAL_DB_NUM / WORKER_CORE_NUM;
 
-std::atomic<uint32_t> next_db_id{0};
-static std::array<uint8_t, NUM_RACKS> worker_table;
+extern std::atomic<uint32_t> next_db_id;
 
 class DPDKHandler {
  public:
@@ -61,6 +63,8 @@ class DPDKHandler {
   std::unordered_map<rte_be32_t, std::shared_ptr<ServerInstance>> ip_to_server_;
   std::array<rte_ring*, RX_CORE_NUM> rx_rings_;
   std::array<rte_ring*, TX_CORE_NUM> tx_rings_;
+
+  std::array<uint8_t, NUM_RACKS> worker_table;
 
   enum class CoreType { RX_CORE, WORKER_CORE, TX_CORE, NONE };
 
@@ -97,7 +101,8 @@ class DPDKHandler {
   };
 
   struct DBPipeline {
-    redis::request req;
+    boost::redis::request req;
+    boost::redis::generic_response resp;
     std::vector<rte_mbuf*> mbufs;
   };
 
@@ -106,6 +111,8 @@ class DPDKHandler {
   static inline void SwapMac(rte_ether_hdr* eth_hdr);
   static inline rte_be32_t SwapIpv4(rte_ipv4_hdr* ip_hdr);
   int PortInit();
+  inline int LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
+                          uint8_t& db_out);
   void RxLoop(CoreInfo core_info);
   void TxLoop(CoreInfo core_info);
   void DBWorker(CoreInfo core_info);

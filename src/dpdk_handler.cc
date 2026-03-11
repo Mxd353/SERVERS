@@ -9,14 +9,10 @@
 #include <rte_per_lcore.h>
 #include <unistd.h>
 
-#include <boost/asio.hpp>
-#include <boost/redis/connection.hpp>
-#include <boost/redis/src.hpp>
 #include <cassert>
 #include <fstream>
 #include <iostream>
 
-#include "lib/sync_connection.hpp"
 #include "lib/utils.h"
 
 /**
@@ -35,31 +31,9 @@ namespace redis = boost::redis;
 
 std::atomic<uint64_t> total_latency_us{0};
 std::atomic<size_t> completed_request_count{0};
+std::atomic<uint32_t> next_db_id{0};
 
 std::ofstream outfile("server.output");
-
-inline void redis_test(redis::sync_connection& conn) {
-  try {
-    redis::request req;
-    redis::response<std::string> resp;
-
-    req.push("PING");
-
-    conn.exec(req, resp);
-
-    auto reply = std::get<0>(resp).value();
-    if (reply != "PONG") {
-      std::cerr << "[redis_test] Unexpected ping reply: " << reply << std::endl;
-      std::exit(1);
-    }
-  } catch (const std::exception& e) {
-    std::cerr << "[redis_test] Redis exception: " << e.what() << std::endl;
-    std::exit(1);
-  } catch (...) {
-    std::cerr << "[redis_test] Unknown exception occurred." << std::endl;
-    std::exit(1);
-  }
-}
 
 DPDKHandler::DPDKHandler() {}
 
@@ -269,14 +243,8 @@ int DPDKHandler::PortInit() {
   return 0;
 }
 
-inline void InitLookupTables() {
-  for (auto rack = 0; rack < NUM_RACKS; ++rack) {
-    worker_table[rack] = rack / RACK_PER_WORKER;
-  }
-}
-
-inline int LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
-                        uint8_t& db_out) {
+inline int DPDKHandler::LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
+                                     uint8_t& db_out) {
   uint32_t ip = rte_be_to_cpu_32(ip_be);
 
   uint8_t rack = static_cast<uint8_t>((ip >> 8) & 0xFF);  // subnet
@@ -450,93 +418,93 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
   if (end_db >= TOTAL_DB_NUM) end_db = TOTAL_DB_NUM - 1;
 
-  RTE_LOG(NOTICE, WORKER, "[Worker core %u] handles DBs: %u ~ %u\n", lcore_id,
-          start_db, end_db);
-
   auto ioc = std::make_shared<net::io_context>();
 
-  std::vector<std::shared_ptr<redis::connection>> conns(DBS_PER_WORKER);
+  std::vector<redis::connection> conns;
+  conns.reserve(DBS_PER_WORKER);
   std::vector<DBPipeline> pipelines(DBS_PER_WORKER);
 
-  for (auto i = 0; i <= DBS_PER_WORKER; ++i) {
+  for (uint32_t i = 0; i < DBS_PER_WORKER; ++i) {
     redis::config cfg;
     cfg.addr.host = "127.0.0.1";
     cfg.addr.port = std::to_string(i + start_db);
 
-    auto conn = std::make_shared<redis::connection>(ioc->get_executor());
-    conn->async_run(cfg, {}, net::consign(net::detached, conn));
-    conns[i] = conn;
+    conns.emplace_back(ioc->get_executor());
+    conns.back().async_run(cfg, {}, net::detached);
   }
 
   std::thread io_thread([ioc] { ioc->run(); });
+
+  RTE_LOG(NOTICE, WORKER, "[Worker core %u] handles DBs: %u ~ %u\n", lcore_id,
+          start_db, end_db);
 
   ipc_req* req = nullptr;
   while (true) {
     if (rte_ring_dequeue(rx_ring, (void**)&req) == 0) {
       std::size_t index = req->db_id - start_db;
 
-      auto conn = conns[index];
-      auto pipeline_ptr = &pipelines[index];
+      auto& conn = conns[index];
+      auto& pipeline = pipelines[index];
 
-      net::post(*ioc, [conn, pipeline_ptr, tx_ring, req_copy = *req]() {
-        auto& pipeline = *pipeline_ptr;
+      KVRequest* kv_header =
+          rte_pktmbuf_mtod_offset(req->mbuf, KVRequest*, KV_HEADER_OFFSET);
 
-        rte_pktmbuf_refcnt_update(req_copy.mbuf, 1);
+      kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
 
-        KVRequest* kv_header = rte_pktmbuf_mtod_offset(
-            req_copy.mbuf, KVRequest*, KV_HEADER_OFFSET);
-        kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
+      std::string_view key{kv_header->key.data(), KEY_LENGTH};
 
-        std::string_view key{kv_header->key.data(), KEY_LENGTH};
+      if (GET_OP(kv_header->combined) == WRITE_REQUEST) {
+        std::string_view value{kv_header->value1.data(), VALUE_LENGTH * 4};
 
-        if (GET_OP(kv_header->combined) == WRITE_REQUEST) {
-          std::string_view value{kv_header->value1.data(), VALUE_LENGTH * 4};
-          pipeline.req.push("SET", key, value);
-        } else {
-          pipeline.req.push("GET", key);
-        }
+        pipeline.req.push("SET", key, value);
+      } else {
+        pipeline.req.push("GET", key);
+      }
 
-        pipeline.mbufs.push_back(req_copy.mbuf);
+      pipeline.mbufs.push_back(req->mbuf);
 
-        if (pipeline.req.get_commands() >= BURST_SIZE) {
-          auto pipe_reqs = std::move(pipeline.req);
-          auto mbufs = std::move(pipeline.mbufs);
+      if (pipeline.req.get_commands() >= BURST_SIZE) {
+        auto pipe_reqs = std::move(pipeline.req);
+        auto& resp = pipeline.resp;
+        auto mbufs = std::move(pipeline.mbufs);
 
-          pipeline.req = redis::request{};
-          pipeline.mbufs = {};
+        pipeline.req = redis::request{};
+        pipeline.mbufs = {};
+        resp.value().clear();
 
-          auto resps = std::make_shared<redis::generic_response>();
+        conn.async_exec(
+            pipe_reqs, resp,
+            [&resp, mbufs = std::move(mbufs), tx_ring](auto ec, auto) mutable {
+              if (ec) {
+                for (auto m : mbufs) rte_pktmbuf_free(m);
+                return;
+              }
 
-          conn->async_exec(
-              pipe_reqs, *resps,
-              [resps, mbufs = std::move(mbufs), tx_ring](auto ec,
-                                                         auto) mutable {
-                if (ec) {
-                  for (auto m : mbufs) rte_pktmbuf_free(m);
-                  return;
-                }
-                auto& vec = resps->value();
-                for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
-                  KVRequest* kv_h = rte_pktmbuf_mtod_offset(
-                      mbufs[i], KVRequest*, KV_HEADER_OFFSET);
-                  if (GET_OP(kv_h->combined) == READ_REQUEST) {
-                    const std::string& val = vec[i].value;
+              auto& vec = resp.value();
 
-                    if (!val.empty()) {
-                      rte_memcpy(kv_h->value1.data(), val.data(),
-                                 VALUE_LENGTH * 4);
-                    }
+              for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
+                KVRequest* kv_h = rte_pktmbuf_mtod_offset(mbufs[i], KVRequest*,
+                                                          KV_HEADER_OFFSET);
+
+                if (GET_OP(kv_h->combined) == READ_REQUEST) {
+                  const std::string& val = vec[i].value;
+
+                  if (!val.empty()) {
+                    rte_memcpy(kv_h->value1.data(), val.data(),
+                               VALUE_LENGTH * 4);
                   }
                 }
-                int ret = rte_ring_enqueue_bulk(
-                    *tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
-                    mbufs.size(), nullptr);
-                if (ret < 0) {
-                  for (auto m : mbufs) rte_pktmbuf_free(m);
-                }
-              });
-        }
-      });
+              }
+              int ret = rte_ring_enqueue_bulk(
+                  tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
+                  mbufs.size(), nullptr);
+
+              if (ret < 0) {
+                for (auto m : mbufs) rte_pktmbuf_free(m);
+              }
+            });
+      }
+
     } else {
       rte_pause();
     }
@@ -545,7 +513,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 }
 
 inline void DPDKHandler::CreatRings() {
-  for (int i = 0; i < RX_CORE_NUM; i++) {
+  for (uint32_t i = 0; i < RX_CORE_NUM; i++) {
     char ring_name[32];
     snprintf(ring_name, sizeof(ring_name), "rx_ring_%d", i);
     rx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
@@ -555,7 +523,7 @@ inline void DPDKHandler::CreatRings() {
     }
   }
 
-  for (int i = 0; i < TX_CORE_NUM; i++) {
+  for (uint32_t i = 0; i < TX_CORE_NUM; i++) {
     char ring_name[32];
     snprintf(ring_name, sizeof(ring_name), "tx_ring_%d", i);
     tx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
@@ -653,22 +621,22 @@ inline void DPDKHandler::LaunchThreads() {
 
     switch (type) {
       case CoreType::RX_CORE: {
-        int ret = rte_eal_remote_launch(LaunchRxLcore, core_args_.back().get(),
-                                        lcore.lcore_id);
+        ret = rte_eal_remote_launch(LaunchRxLcore, core_args_.back().get(),
+                                    lcore.lcore_id);
         core_name = "rx";
         break;
       }
 
       case CoreType::WORKER_CORE: {
-        int ret = rte_eal_remote_launch(
-            LaunchWorkerLcore, core_args_.back().get(), lcore.lcore_id);
+        ret = rte_eal_remote_launch(LaunchWorkerLcore, core_args_.back().get(),
+                                    lcore.lcore_id);
         core_name = "worker";
         break;
       }
 
       case CoreType::TX_CORE: {
-        int ret = rte_eal_remote_launch(LaunchTxLcore, core_args_.back().get(),
-                                        lcore.lcore_id);
+        ret = rte_eal_remote_launch(LaunchTxLcore, core_args_.back().get(),
+                                    lcore.lcore_id);
         core_name = "tx";
         break;
       }
@@ -692,7 +660,9 @@ inline void DPDKHandler::LaunchThreads() {
 void DPDKHandler::Start() {
   uint16_t port = 0;
 
-  InitLookupTables();
+  for (uint32_t rack = 0; rack < NUM_RACKS; ++rack) {
+    worker_table[rack] = rack / RACK_PER_WORKER;
+  }
 
   InitAndLaunchCores();
 
