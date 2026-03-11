@@ -326,7 +326,8 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           if (rte_mempool_get(ipc_mempool_, (void**)&req) == 0) {
             req->db_id = db_id;
             req->mbuf = rx_pkts[i];
-            if (unlikely(rte_ring_enqueue((*rx_rings)[worker_id], req) < 0)) {
+            if (unlikely(rte_ring_mp_enqueue((*rx_rings)[worker_id], req) <
+                         0)) {
               rte_pktmbuf_free(rx_pkts[i]);
               rte_mempool_put(ipc_mempool_, req);
             }
@@ -342,9 +343,9 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
 void DPDKHandler::TxLoop(CoreInfo core_info) {
   const uint16_t port = 0;
 
-  thread_local uint lcore_id = core_info.lcore_id;
-  thread_local uint16_t queue_id = core_info.queue_id;
-  thread_local auto* tx_ring = core_info.tx_ring;
+  uint lcore_id = core_info.lcore_id;
+  uint16_t queue_id = core_info.queue_id;
+  auto* tx_ring = core_info.tx_ring;
 
   RTE_LOG(NOTICE, CORE, "[TX Core %u] polling queue: %hu\n", lcore_id,
           queue_id);
@@ -352,10 +353,10 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
   rte_mbuf* tx_pkts[BURST_SIZE];
 
   while (true) {
-    uint16_t nb_pkts = rte_ring_dequeue_burst(
+    uint16_t nb_pkts = rte_ring_sc_dequeue_burst(
         tx_ring, reinterpret_cast<void**>(tx_pkts), BURST_SIZE, nullptr);
 
-    if (unlikely(nb_pkts <= 0)) {
+    if (unlikely(nb_pkts == 0)) {
       rte_pause();
       continue;
     } else {
@@ -370,33 +371,6 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 
     RTE_LOG(NOTICE, CORE, "[TX Core %u] exiting\n", lcore_id);
     return;
-    // std::vector<uint8_t> *packet_data = nullptr;
-    // if (rte_ring_dequeue(tx_ring, (void **)&packet_data) == 0) {
-    //   if (packet_data) {
-    //     rte_mbuf *mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
-    //     if (!mbuf) {
-    //       std::cerr << "Failed to allocate mbuf" << std::endl;
-    //       delete packet_data;
-    //       continue;
-    //     }
-    //     char *mbuf_data = rte_pktmbuf_mtod(mbuf, char *);
-    //     rte_memcpy(mbuf_data, packet_data->data(), packet_data->size());
-
-    //     rte_pktmbuf_data_len(mbuf) = packet_data->size();
-    //     rte_pktmbuf_pkt_len(mbuf) = rte_pktmbuf_data_len(mbuf);
-    //     delete packet_data;
-    //     int ret = rte_eth_tx_burst(0 /*port id*/, queue_id, &mbuf, 1);
-    //     if (ret < 1) {
-    //       RTE_LOG(ERR, CORE, "Send error: %s (errno=%d)\n",
-    //       rte_strerror(-ret),
-    //               -ret);
-    //       rte_pktmbuf_free(mbuf);
-    //       continue;
-    //     }
-    //   }
-    // } else {
-    //   rte_delay_us_sleep(10);
-    // }
   }
 }
 
@@ -466,7 +440,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   while (true) {
     struct ipc_req* reqs[BURST_SIZE];
     const uint16_t nb_rx =
-        rte_ring_dequeue_burst(rx_ring, (void**)reqs, BURST_SIZE, nullptr);
+        rte_ring_sc_dequeue_bulk(rx_ring, (void**)reqs, BURST_SIZE, nullptr);
 
     if (nb_rx > 0) {
       for (uint16_t i = 0; i < nb_rx; ++i) {
@@ -520,7 +494,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
                   return;
                 }
 
-                uint16_t ret = rte_ring_enqueue_bulk(
+                uint16_t ret = rte_ring_mp_enqueue_bulk(
                     tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
                     mbufs.size(), nullptr);
                 if (ret < mbufs.size()) {
@@ -571,7 +545,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
                   }
                 }
 
-                uint16_t ret = rte_ring_enqueue_burst(
+                uint16_t ret = rte_ring_mp_enqueue_bulk(
                     tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
                     mbufs.size(), nullptr);
                 if (ret < mbufs.size()) {
