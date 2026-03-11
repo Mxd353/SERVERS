@@ -436,40 +436,36 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   using namespace c_m_proto;
   namespace net = boost::asio;
 
-  thread_local uint lcore_id = core_info.lcore_id;
-  thread_local auto* rx_ring = core_info.work_rings.first;
-  thread_local auto* tx_ring = core_info.work_rings.second;
+  uint lcore_id = core_info.lcore_id;
+  auto* rx_ring = core_info.work_rings.first;
+  auto* tx_ring = core_info.work_rings.second;
 
   uint32_t start_db = next_db_id.fetch_add(DBS_PER_WORKER);
   uint32_t end_db = start_db + DBS_PER_WORKER - 1;
 
   if (start_db >= TOTAL_DB_NUM) {
-    std::cerr << "Worker lcore " << lcore_id << " has no DB to handle.\n";
+    RTE_LOG(ERR, WORKER, "[Worker core %u] has no DB to handle.\n", lcore_id);
     return;
   }
+
   if (end_db >= TOTAL_DB_NUM) end_db = TOTAL_DB_NUM - 1;
 
-  std::cout << "Worker lcore " << lcore_id << " handles DBs: " << start_db
-            << " ~ " << end_db << std::endl;
+  RTE_LOG(NOTICE, WORKER, "[Worker core %u] handles DBs: %u ~ %u\n", lcore_id,
+          start_db, end_db);
 
   auto ioc = std::make_shared<net::io_context>();
-  std::vector<std::shared_ptr<redis::connection>> conns;
-  std::vector<
-      std::pair<std::shared_ptr<redis::request>, std::vector<rte_mbuf*>>>
-      pipelines;
 
-  for (auto port = start_db; port <= end_db; ++port) {
+  std::vector<std::shared_ptr<redis::connection>> conns(DBS_PER_WORKER);
+  std::vector<DBPipeline> pipelines(DBS_PER_WORKER);
+
+  for (auto i = 0; i <= DBS_PER_WORKER; ++i) {
     redis::config cfg;
     cfg.addr.host = "127.0.0.1";
-    cfg.addr.port = std::to_string(port);
+    cfg.addr.port = std::to_string(i + start_db);
 
     auto conn = std::make_shared<redis::connection>(ioc->get_executor());
     conn->async_run(cfg, {}, net::consign(net::detached, conn));
-    conns.push_back(conn);
-
-    auto db_req = std::make_shared<redis::request>();
-    std::vector<rte_mbuf*> burst_mbufs;
-    pipelines.push_back(std::make_pair(db_req, burst_mbufs));
+    conns[i] = conn;
   }
 
   std::thread io_thread([ioc] { ioc->run(); });
@@ -477,12 +473,12 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   ipc_req* req = nullptr;
   while (true) {
     if (rte_ring_dequeue(rx_ring, (void**)&req) == 0) {
-      std::size_t index = req->db_id % conns.size();
+      std::size_t index = req->db_id - start_db;
+
       auto conn = conns[index];
       auto pipeline_ptr = &pipelines[index];
 
-      net::post(*ioc, [conn, pipeline_ptr, tx_rings = &tx_rings_,
-                       req_copy = *req]() {
+      net::post(*ioc, [conn, pipeline_ptr, tx_ring, req_copy = *req]() {
         auto& pipeline = *pipeline_ptr;
 
         rte_pktmbuf_refcnt_update(req_copy.mbuf, 1);
@@ -490,59 +486,55 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         KVRequest* kv_header = rte_pktmbuf_mtod_offset(
             req_copy.mbuf, KVRequest*, KV_HEADER_OFFSET);
         kv_header->combined |= 0x1000;  // SERVER_REPLY << 12
-        // uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
         std::string_view key{kv_header->key.data(), KEY_LENGTH};
 
         if (GET_OP(kv_header->combined) == WRITE_REQUEST) {
           std::string_view value{kv_header->value1.data(), VALUE_LENGTH * 4};
-          pipeline.first->push("SET", key, value);
+          pipeline.req.push("SET", key, value);
         } else {
-          pipeline.first->push("GET", key);
+          pipeline.req.push("GET", key);
         }
 
-        pipeline.second.push_back(req_copy.mbuf);
+        pipeline.mbufs.push_back(req_copy.mbuf);
 
-        if (pipeline.first->get_commands() >= BURST_SIZE) {
-          auto pipe_reqs = std::move(pipeline.first);
-          auto mbufs = std::move(pipeline.second);
+        if (pipeline.req.get_commands() >= BURST_SIZE) {
+          auto pipe_reqs = std::move(pipeline.req);
+          auto mbufs = std::move(pipeline.mbufs);
 
-          pipeline.first = std::make_shared<redis::request>();
-          pipeline.second.clear();
+          pipeline.req = redis::request{};
+          pipeline.mbufs = {};
 
           auto resps = std::make_shared<redis::generic_response>();
 
-          unsigned core_id = req_copy.db_id % TX_CORE_NUM;
+          conn->async_exec(
+              pipe_reqs, *resps,
+              [resps, mbufs = std::move(mbufs), tx_ring](auto ec,
+                                                         auto) mutable {
+                if (ec) {
+                  for (auto m : mbufs) rte_pktmbuf_free(m);
+                  return;
+                }
+                auto& vec = resps->value();
+                for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
+                  KVRequest* kv_h = rte_pktmbuf_mtod_offset(
+                      mbufs[i], KVRequest*, KV_HEADER_OFFSET);
+                  if (GET_OP(kv_h->combined) == READ_REQUEST) {
+                    const std::string& val = vec[i].value;
 
-          conn->async_exec(*pipe_reqs, *resps,
-                           [resps, mbufs = std::move(mbufs), tx_rings, core_id](
-                               auto ec, auto) mutable {
-                             if (ec) {
-                               for (auto m : mbufs) rte_pktmbuf_free(m);
-                               return;
-                             }
-                             auto& vec = resps->value();
-                             for (size_t i = 0;
-                                  i < vec.size() && i < mbufs.size(); ++i) {
-                               KVRequest* kv_h = rte_pktmbuf_mtod_offset(
-                                   mbufs[i], KVRequest*, KV_HEADER_OFFSET);
-                               if (GET_OP(kv_h->combined) == READ_REQUEST) {
-                                 const std::string& val = vec[i].value;
-
-                                 if (!val.empty()) {
-                                   rte_memcpy(kv_h->value1.data(), val.data(),
-                                              VALUE_LENGTH * 4);
-                                 }
-                               }
-                             }
-                             int ret = rte_ring_enqueue_bulk(
-                                 (*tx_rings)[core_id],
-                                 reinterpret_cast<void* const*>(mbufs.data()),
-                                 mbufs.size(), nullptr);
-                             if (ret < 0) {
-                               for (auto m : mbufs) rte_pktmbuf_free(m);
-                             }
-                           });
+                    if (!val.empty()) {
+                      rte_memcpy(kv_h->value1.data(), val.data(),
+                                 VALUE_LENGTH * 4);
+                    }
+                  }
+                }
+                int ret = rte_ring_enqueue_bulk(
+                    *tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
+                    mbufs.size(), nullptr);
+                if (ret < 0) {
+                  for (auto m : mbufs) rte_pktmbuf_free(m);
+                }
+              });
         }
       });
     } else {

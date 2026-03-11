@@ -11,6 +11,8 @@
 #define RTE_LOGTYPE_RING RTE_LOGTYPE_USER1
 #define RTE_LOGTYPE_DB RTE_LOGTYPE_USER2
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
+#define RTE_LOGTYPE_WORKER RTE_LOGTYPE_USER4
+
 #define TX_NUM_MBUFS 16'383
 #define RX_NUM_MBUFS 32'767
 #define MBUF_CACHE_SIZE 256
@@ -92,6 +94,11 @@ class DPDKHandler {
   struct ipc_req {
     uint8_t db_id;
     rte_mbuf* mbuf;
+  };
+
+  struct DBPipeline {
+    redis::request req;
+    std::vector<rte_mbuf*> mbufs;
   };
 
   std::vector<std::unique_ptr<CoreArgs>> core_args_;
