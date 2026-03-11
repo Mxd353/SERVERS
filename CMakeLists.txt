@@ -119,8 +119,6 @@ target_include_directories(${TARGET_NAME}
         ${Boost_INCLUDE_DIRS}
         ${LIBUV_INCLUDE_DIR}
         ${DPDK_INCLUDE_DIRS}
-        ${HIREDIS_HEADER}
-        ${REDIS_PLUS_PLUS_HEADER}
         include
         ${CMAKE_SOURCE_DIR}
 )

@@ -7,7 +7,7 @@
 #include <rte_mbuf.h>
 
 #include <boost/asio.hpp>
-#include <boost/redis/src.hpp>
+#include <boost/redis.hpp>
 
 #include "server_instance.h"
 
