@@ -100,12 +100,6 @@ class DPDKHandler {
     rte_mbuf* mbuf;
   };
 
-  struct DBPipeline {
-    boost::redis::request req;
-    boost::redis::generic_response resp;
-    std::vector<rte_mbuf*> mbufs;
-  };
-
   std::vector<std::unique_ptr<CoreArgs>> core_args_;
 
   static inline void SwapMac(rte_ether_hdr* eth_hdr);
