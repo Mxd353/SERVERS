@@ -5,6 +5,7 @@
 #include "lib/utils.h"
 
 void ServerCluster::InitServers() {
+  using namespace c_m_proto;
   int db = 0;
   auto shared_clusters =
       std::make_shared<const std::vector<std::vector<std::string>>>(
@@ -18,11 +19,11 @@ void ServerCluster::InitServers() {
     return;
   }
 
-  auto sock_config =
-      std::make_shared<const SockConfig>(SockConfig{sockfd_, ifindex_});
+  auto sock_config = std::make_shared<const SockConfig>(
+      SockConfig{sockfd_, ifindex_});
 
   for (size_t rack_idx = 0; rack_idx < clusters_info_.size(); ++rack_idx) {
-    for (const auto &ip : clusters_info_[rack_idx]) {
+    for (const auto& ip : clusters_info_[rack_idx]) {
       ServerInstance::ServerInfo server_info = {static_cast<int>(rack_idx), ip,
                                                 src_mac_, db++};
       auto server = std::make_shared<ServerInstance>(
@@ -44,7 +45,7 @@ void ServerCluster::Start(int thread_count) {
 void ServerCluster::Stop() {
   stop_receive_thread_.store(true, std::memory_order_relaxed);
 
-  for (auto &t : receive_threads_) {
+  for (auto& t : receive_threads_) {
     if (t.joinable()) t.join();
   }
   receive_threads_.clear();
@@ -98,7 +99,7 @@ void ServerCluster::StartReceiveThreads(int thread_count) {
   int servers_per_thread = (total_servers + thread_count - 1) / thread_count;
   std::vector<std::shared_ptr<ServerInstance>> all_servers;
 
-  for (const auto &it : ip_to_server_) {
+  for (const auto& it : ip_to_server_) {
     all_servers.push_back(it.second);
   }
 
@@ -115,9 +116,10 @@ void ServerCluster::StartReceiveThreads(int thread_count) {
 
 void ServerCluster::ReceiveThread(
     std::vector<std::shared_ptr<ServerInstance>> servers_subset) {
+  using namespace c_m_proto;
   ServerMap local_map;
 
-  for (auto &s : servers_subset) {
+  for (auto& s : servers_subset) {
     local_map[s->GetIp()] = s;
   }
 
@@ -132,18 +134,18 @@ void ServerCluster::ReceiveThread(
     std::vector<uint8_t> buffer(BUFFER_SIZE);
     ssize_t recvlen =
         recvfrom(sockfd_, buffer.data(), buffer.size(), MSG_DONTWAIT,
-                 (struct sockaddr *)&src_addr, &addrlen);
+                 (struct sockaddr*)&src_addr, &addrlen);
     if (recvlen > 0) {
       error_count = 0;
-      struct ethhdr *eth_hdr = reinterpret_cast<struct ethhdr *>(buffer.data());
+      struct ethhdr* eth_hdr = reinterpret_cast<struct ethhdr*>(buffer.data());
       if (memcmp(eth_hdr->h_source, src_mac_.data(), ETH_ALEN) == 0) continue;
       if (ntohs(eth_hdr->h_proto) != ETH_P_IP) continue;
       if (recvlen < ETH_HLEN + IPV4_HDR_LEN) {
         std::cerr << "[Recv] Packet too short: " << recvlen << " bytes.\n";
         continue;
       }
-      struct iphdr *ip_hdr =
-          reinterpret_cast<struct iphdr *>(buffer.data() + ETH_HLEN);
+      struct iphdr* ip_hdr =
+          reinterpret_cast<struct iphdr*>(buffer.data() + ETH_HLEN);
 
       if (ip_hdr->saddr != inet_addr(controller_info_.ip.c_str())) continue;
 
@@ -169,6 +171,6 @@ void ServerCluster::ReceiveThread(
   std::cout << "[Recv] Thread exiting cleanly.\n";
 }
 
-const ServerCluster::ServerMap &ServerCluster::GetIpToServerMap() const {
+const ServerCluster::ServerMap& ServerCluster::GetIpToServerMap() const {
   return ip_to_server_;
 }

@@ -5,26 +5,33 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
-#define ENCODE_COMBINED(dev_id, is_req, op)                               \
-  (((dev_id & 0xFF) << 8) | ((is_req & 0x0F) << 4) | ((op & 0x03) << 2) | \
-   (0x00 & 0x03))
+#define ENCODE_DEV_INFO(dev_id, dev_type) \
+  (((dev_id & 0x1F) << 5) | ((dev_type & 0x07) << 2))
+
+#define GET_DEV_ID(dev_info) static_cast<uint8_t>(((dev_info) >> 3) & 0x1F)
+#define GET_DEV_TYPE(dev_info) static_cast<uint8_t>((dev_info) & 0x07)
+
+#define ENCODE_COMBINED(is_req, op) \
+  (((is_req & 0x0F) << 4) | ((op & 0x03) << 2) | (0x00 & 0x03))
+
+#define GET_IS_REQ(combined) static_cast<uint8_t>(((combined) >> 4) & 0x0F)
+#define GET_OP(combined) static_cast<uint8_t>(((combined) >> 2) & 0x03)
+#define GET_HOT_QUERY(combined) static_cast<uint8_t>((combined) & 0x03)
+
 #define DECODE_IP(ip) \
   ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF
 
-#define GET_DEV_ID(combined) static_cast<uint8_t>((combined) & 0xFF)
-#define GET_IS_REQ(combined) static_cast<uint8_t>(((combined) >> 12) & 0x0F)
-#define GET_OP(combined) static_cast<uint8_t>(((combined) >> 10) & 0x03)
-#define GET_HOT_QUERY(combined) static_cast<uint8_t>(((combined) >> 8) & 0x03)
-
-#define IP_PROTOCOLS_NETCACHE 0x54
-#define IP_PROTOCOLS_MIGRATION_INFO 0x57
-#define IP_PROTOCOLS_CACHE_MIGRATE 0x60
-#define IP_PROTOCOLS_ASK 0x61
+#define UDP_PORT_KV 50000
+#define UDP_PORT_MI 50001
+#define UDP_PORT_CM 50002
 
 #define KEY_LENGTH 16
 #define VALUE_LENGTH 4
+
+namespace c_m_proto {
 
 constexpr size_t CACHE_SIZE = 310;
 constexpr size_t CHUNK_SIZE = 128;
@@ -52,7 +59,7 @@ constexpr uint8_t MIGRATION_TRANSFER_DONE = 6;
 struct ControllerInfo {
   std::string iface;
   std::string ip;
-  std::array<uint8_t, ETH_ALEN> mac;
+  std::array<uint8_t, RTE_ETHER_ADDR_LEN> mac;
 };
 
 struct SockConfig {
@@ -61,14 +68,11 @@ struct SockConfig {
 };
 
 #pragma pack(push, 1)
-struct BaseHeader {
-  uint32_t request_id = 0;
-};
 
-struct KVHeader : public BaseHeader {
-  uint16_t
-      combined;  // dev_id(8 bit) | is_req(4 bit) | op(2 bit) | hot_query(2 bit)
-  uint32_t count = 0;
+struct KVRequest {
+  uint8_t dev_info;  // dev_id (5 bits) | dev_type (3 bits)
+  uint32_t request_id = 0;
+  uint8_t combined;  // is_req(4 bit) | op(2 bit) | hot_query(2 bit)
   std::array<char, KEY_LENGTH> key{};
   std::array<char, VALUE_LENGTH> value1{};
   std::array<char, VALUE_LENGTH> value2{};
@@ -76,7 +80,7 @@ struct KVHeader : public BaseHeader {
   std::array<char, VALUE_LENGTH> value4{};
 };
 
-struct KVMigrateHeader : public KVHeader {  // pick up from KVHeader
+struct KVMigrate : public KVRequest {  // pick up from KVRequest
   uint32_t migration_id = 0;
   uint8_t src_rack_id = 0;
   uint8_t dst_rack_id = 0;
@@ -84,57 +88,56 @@ struct KVMigrateHeader : public KVHeader {  // pick up from KVHeader
   uint16_t total_keys = 0;
 };
 
-struct MigrationInfo : public BaseHeader {
+struct MigrationInfo {
+  uint32_t request_id = 0;
   uint32_t migration_id = 0;
   uint8_t migration_status = 0;
   uint8_t src_rack_id = 0;
   uint8_t dst_rack_id = 0;
 };
 
-struct CacheMigrateHeader : public BaseHeader {
+struct CacheMigrate {
+  uint32_t request_id = 0;
   uint32_t migration_id = 0;
   std::array<char, KEY_LENGTH> key{};
 };
 
-struct AskPacket : public BaseHeader {
-  uint8_t ask = 0;
-};
 #pragma pack(pop)
 
-constexpr uint16_t IPV4_HDR_LEN = sizeof(struct rte_ipv4_hdr);
-constexpr uint16_t C_M_HDR_LEN = sizeof(struct KVHeader);
+constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
+constexpr uint16_t UDP_HDR_LEN = sizeof(rte_udp_hdr);
+constexpr uint16_t KV_HDR_LEN = sizeof(KVRequest);
+constexpr uint16_t KV_HEADER_OFFSET =
+    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN;
 
-const uint16_t TOTAL_LEN = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + C_M_HDR_LEN;
-template <typename T>
-struct PacketTraits;
+const uint16_t TOTAL_LEN =
+    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + KV_HDR_LEN;
 
-template <typename T>
+template <typename PayloadType>
 struct PacketTraits {
-  static_assert(sizeof(T) == 0,
-                "PacketTraits<T> is not specialized for this type");
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_KV;
+  static constexpr uint16_t DstPort = UDP_PORT_KV;
 };
 
 template <>
-struct PacketTraits<KVHeader> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_NETCACHE;
-};
-
-template <>
-struct PacketTraits<KVMigrateHeader> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_NETCACHE;
+struct PacketTraits<KVRequest> {
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_KV;
+  static constexpr uint16_t DstPort = UDP_PORT_KV;
 };
 
 template <>
 struct PacketTraits<MigrationInfo> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_MIGRATION_INFO;
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_MI;
+  static constexpr uint16_t DstPort = UDP_PORT_MI;
 };
 
 template <>
-struct PacketTraits<CacheMigrateHeader> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_CACHE_MIGRATE;
+struct PacketTraits<CacheMigrate> {
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_CM;
+  static constexpr uint16_t DstPort = UDP_PORT_CM;
 };
-
-template <>
-struct PacketTraits<AskPacket> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_ASK;
-};
+}  // namespace c_m_proto

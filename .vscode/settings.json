@@ -76,7 +76,12 @@
         "typeindex": "cpp",
         "*.ipp": "cpp",
         "shared_mutex": "cpp",
-        "ranges": "cpp"
+        "ranges": "cpp",
+        "any": "cpp",
+        "coroutine": "cpp",
+        "forward_list": "cpp",
+        "source_location": "cpp",
+        "stdfloat": "cpp"
     },
     "markdown.validate.enabled": true,
 }

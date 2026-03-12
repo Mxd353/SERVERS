@@ -1,6 +1,7 @@
 #include <atomic>
 #include <csignal>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 
@@ -29,9 +30,11 @@ void signalHandler(int signal) {
   double latency_us_per_request =
       completed > 0 ? static_cast<double>(total_latency) / completed : 0.0;
 
+  std::cout << std::fixed << std::setprecision(2);
   std::cout << "Total Requests Completed: " << completed << "\n"
             << "Average Latency per Request (ms/op): "
-            << latency_us_per_request / 1'000.0 << std::endl;
+            << latency_us_per_request / 1'000.0 << "( "
+            << latency_us_per_request << " us/op)" << std::endl;
 
   std::exit(0);
 }
@@ -39,7 +42,7 @@ void signalHandler(int signal) {
 void parseClusterInfo(const std::string& server_conf,
                       const std::string& controller_conf,
                       std::vector<std::vector<std::string>>& racks,
-                      ControllerInfo& controller_info) {
+                      c_m_proto::ControllerInfo& controller_info) {
   std::ifstream server_file(server_conf);
   std::ifstream controller_file(controller_conf);
   std::string line;
@@ -89,13 +92,13 @@ void parseClusterInfo(const std::string& server_conf,
   }
 }
 
-int main(int argc, char* argv[]) {
+auto main(int argc, char* argv[]) -> int {
   (void)argc;
   std::string server_conf = "conf/server_ips.conf";
   std::string controller_conf = "conf/controller_info.conf";
 
   std::vector<std::vector<std::string>> racks;
-  ControllerInfo controller_info;
+  c_m_proto::ControllerInfo controller_info;
 
   parseClusterInfo(server_conf, controller_conf, racks, controller_info);
   if (racks.empty()) {

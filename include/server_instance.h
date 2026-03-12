@@ -2,8 +2,8 @@
 
 #include <net/ethernet.h>
 #include <netinet/ip.h>
+#include <netinet/udp.h>
 #include <rte_ring.h>
-#include <sw/redis++/redis++.h>
 
 #include <atomic>
 #include <boost/asio.hpp>
@@ -28,10 +28,11 @@ class ServerInstance {
     int db;
   };
 
-  ServerInstance(const ServerInfo& server_info,
-                 std::shared_ptr<const SockConfig> sock_config,
-                 std::shared_ptr<const ControllerInfo> controller_info,
-                 std::shared_ptr<const ClusterInfo> clusters_info);
+  ServerInstance(
+      const ServerInfo& server_info,
+      std::shared_ptr<const c_m_proto::SockConfig> sock_config,
+      std::shared_ptr<const c_m_proto::ControllerInfo> controller_info,
+      std::shared_ptr<const ClusterInfo> clusters_info);
   ~ServerInstance();
 
   [[nodiscard]] uint32_t GetIp() const noexcept { return server_ip_in_; }
@@ -43,8 +44,8 @@ class ServerInstance {
 
  private:
   ServerInfo server_info_;
-  std::shared_ptr<const SockConfig> sock_config_;
-  std::shared_ptr<const ControllerInfo> controller_info_;
+  std::shared_ptr<const c_m_proto::SockConfig> sock_config_;
+  std::shared_ptr<const c_m_proto::ControllerInfo> controller_info_;
   std::shared_ptr<const ClusterInfo> clusters_info_;
 
   uint32_t server_ip_in_;
@@ -57,21 +58,22 @@ class ServerInstance {
   std::weak_ptr<int> kv_migration_event_fd_ptr_;
 
   std::atomic<bool> running_{false};
-  std::unique_ptr<sw::redis::Redis> redis_;
 
   uint8_t fsm_;
 
   // RequestMap<uint32_t, std::promise<bool>> request_map_;
 
   template <typename PayloadType>
-  std::vector<uint8_t> ConstructPacket(std::unique_ptr<PayloadType> payload,
-                                       uint32_t dst_ip, uint32_t src_ip);
+  auto ConstructPacket(std::unique_ptr<PayloadType> payload, uint32_t dst_ip,
+                       uint32_t src_ip) -> std::vector<uint8_t>;
   bool SendPacket(const std::vector<uint8_t>& packet);
   void HandleMigrationInfo(const std::vector<uint8_t>& packet);
-  std::vector<std::pair<std::string, uint>> HashToIps(
-      std::vector<uint> indices, const std::vector<std::string>& ip_list);
-  inline std::vector<uint8_t> ConstructMigratePacket(
-      uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
-      uint8_t dst_rack_id, uint16_t index_size);
+  auto HashToIps(const std::vector<uint32_t>& indices,
+                 const std::vector<std::string>& ip_list)
+      -> std::vector<std::pair<std::string, uint32_t>>;
+  inline auto ConstructMigratePacket(uint32_t dst_ip, uint32_t src_ip,
+                                     uint16_t index, uint32_t migration_id,
+                                     uint8_t dst_rack_id, uint16_t index_size)
+      -> std::vector<uint8_t>;
   void StartMigration(const std::vector<uint8_t>& packet);
 };
