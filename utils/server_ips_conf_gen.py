@@ -1,9 +1,9 @@
 def generate_ips():
     lines = []
-    for i in range(7, 39):
-        lines.append("# Rack {}".format(i - 7))
+    for i in range(0, 32):
+        lines.append("# Rack {}".format(i))
         for j in range(1, 33):
-            lines.append("192.168.{}.{}".format(i, j))
+            lines.append("10.0.{}.{}".format(i, j))
         lines.append("")
     return lines
 
