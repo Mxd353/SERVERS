@@ -295,7 +295,8 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
             rte_prefetch0(rte_pktmbuf_mtod(rx_pkts[i + 2], void*));
 
           auto* mbuf = rx_pkts[i];
-          auto* eth_hdr = rte_pktmbuf_mtod(mbuf, rte_ether_hdr*);
+
+          rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(mbuf, rte_ether_hdr*);
 
           rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
 
@@ -305,7 +306,6 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           }
           rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
 
-          // uint16_t src_port = rte_be_to_cpu_16(udp_hdr->src_port);
           uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
 
           if (unlikely(dst_port != UDP_PORT_KV)) {
@@ -717,6 +717,8 @@ void DPDKHandler::Start() {
   for (uint32_t rack = 0; rack < NUM_RACKS; ++rack) {
     worker_table[rack] = rack / RACK_PER_WORKER;
   }
+
+  CreatRings();
 
   InitAndLaunchCores();
 
