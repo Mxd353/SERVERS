@@ -28,18 +28,23 @@
 #define UDP_PORT_MI 50001
 #define UDP_PORT_CM 50002
 
-#define KEY_LENGTH 16
-#define VALUE_LENGTH 4
+// #define KEY_LENGTH 16
+// #define VALUE_LENGTH 4
 
 namespace c_m_proto {
 
 constexpr size_t CACHE_SIZE = 310;
 constexpr size_t CHUNK_SIZE = 128;
+
+constexpr size_t KEY_LENGTH = 16;
+constexpr size_t VALUE_LENGTH = 4;
+
 constexpr uint16_t RETRIES = 3;
 
 // op
 constexpr uint8_t READ_REQUEST = 0;
 constexpr uint8_t WRITE_REQUEST = 1;
+constexpr uint8_t NO_REQUEST = 0xFF;
 
 // is_req
 constexpr uint8_t CLIENT_REQUEST = 0;
