@@ -78,7 +78,7 @@ void ServerInstance::CacheMigrate(const std::string_view& key,
 template <typename PayloadType>
 auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
                                      uint32_t dst_ip, uint32_t src_ip)
-    -> std::vector<uint8_t> {
+    -> ServerInstance::Packet {
   if (!payload) {
     throw std::invalid_argument("Payload cannot be null");
   }
@@ -88,7 +88,7 @@ auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
 
   size_t payload_size = sizeof(PayloadType);
   size_t total_size = ETH_HLEN + IPV4_HDR_LEN + UDP_HDR_LEN + payload_size;
-  std::vector<uint8_t> packet(total_size);
+  Packet packet(total_size);
 
   struct ethhdr* eth_hdr = reinterpret_cast<struct ethhdr*>(packet.data());
   memcpy(eth_hdr->h_dest, controller_info_->mac.data(), ETH_ALEN);
@@ -121,7 +121,7 @@ auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
   return packet;
 }
 
-bool ServerInstance::SendPacket(const std::vector<uint8_t>& packet) {
+bool ServerInstance::SendPacket(const Packet& packet) {
   if (packet.size() < IPV4_HDR_LEN) {
     std::cerr << "Packet too small to extract IP header." << std::endl;
     return false;
@@ -148,9 +148,9 @@ bool ServerInstance::SendPacket(const std::vector<uint8_t>& packet) {
   return true;
 }
 
-void ServerInstance::HandlePacket(const std::vector<uint8_t>& packet) {
-  const struct udphdr* udp_hdr = reinterpret_cast<const struct udphdr*>(
-      packet.data() + ETH_HLEN + IPV4_HDR_LEN);
+void ServerInstance::HandlePacket(const Packet& packet) {
+  const udphdr* udp_hdr =
+      reinterpret_cast<const udphdr*>(packet.data() + ETH_HLEN + IPV4_HDR_LEN);
   switch (udp_hdr->dest) {
     case UDP_PORT_KV:
       HandleMigrationInfo(packet);
@@ -162,10 +162,10 @@ void ServerInstance::HandlePacket(const std::vector<uint8_t>& packet) {
   }
 }
 
-void ServerInstance::HandleMigrationInfo(const std::vector<uint8_t>& packet) {
-  const struct MigrationInfo* migration_info_hdr =
-      reinterpret_cast<const struct MigrationInfo*>(packet.data() + ETH_HLEN +
-                                                    IPV4_HDR_LEN);
+void ServerInstance::HandleMigrationInfo(const Packet& packet) {
+  const MigrationInfo* migration_info_hdr =
+      reinterpret_cast<const MigrationInfo*>(packet.data() +
+                                             c_m_proto::KV_HEADER_OFFSET);
   switch (migration_info_hdr->migration_status) {
     case MIGRATION_START:
       StartMigration(packet);
@@ -203,10 +203,10 @@ auto ServerInstance::HashToIps(const std::vector<uint32_t>& indices,
 
 inline auto ServerInstance::ConstructMigratePacket(
     uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
-    uint8_t dst_rack_id, uint16_t index_size) -> std::vector<uint8_t> {
+    uint8_t dst_rack_id, uint16_t index_size) -> ServerInstance::Packet {
   size_t payload_size = sizeof(KVMigrate);
   size_t total_size = ETH_HLEN + IPV4_HDR_LEN + UDP_HDR_LEN + payload_size;
-  std::vector<uint8_t> packet(total_size);
+  Packet packet(total_size);
 
   uint8_t s_mac[ETH_ALEN];
   uint8_t d_mac[ETH_ALEN];
@@ -251,7 +251,7 @@ inline auto ServerInstance::ConstructMigratePacket(
   return packet;
 }
 
-void ServerInstance::StartMigration(const std::vector<uint8_t>& packet) {
+void ServerInstance::StartMigration(const Packet& packet) {
   // if (fsm_ != MIGRATION_NO) {
   //   std::cerr << "Migration already in progress or completed.\n";
   //   return;
@@ -259,9 +259,9 @@ void ServerInstance::StartMigration(const std::vector<uint8_t>& packet) {
   std::cout << "[Rack " << server_info_.rack_id
             << "] Get a StartMigration packet\n";
 
-  const struct MigrationInfo* migration_info_hdr =
-      reinterpret_cast<const struct MigrationInfo*>(packet.data() + ETH_HLEN +
-                                                    IPV4_HDR_LEN);
+  const MigrationInfo* migration_info_hdr =
+      reinterpret_cast<const MigrationInfo*>(packet.data() +
+                                             c_m_proto::KV_HEADER_OFFSET);
 
   const auto& dst_cluster = (*clusters_info_)[migration_info_hdr->dst_rack_id];
 
@@ -269,11 +269,11 @@ void ServerInstance::StartMigration(const std::vector<uint8_t>& packet) {
       utils::SampleIndices(index_base_, index_limit_, CHUNK_SIZE), dst_cluster);
 
   for (const auto& it : index_to_ips) {
-    std::vector<uint8_t> c_mpacket = ConstructMigratePacket(
+    Packet c_mpacket = ConstructMigratePacket(
         inet_addr(it.first.c_str()), server_ip_in_, it.second,
         migration_info_hdr->migration_id, migration_info_hdr->dst_rack_id,
         index_to_ips.size());
-    auto* packet_data = new std::vector<uint8_t>(std::move(c_mpacket));
+    auto* packet_data = new Packet(std::move(c_mpacket));
 
     int ret = rte_ring_enqueue(kv_migration_ring_, packet_data);
     if (ret < 0) {

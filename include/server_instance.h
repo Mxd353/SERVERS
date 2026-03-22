@@ -20,6 +20,7 @@ class ServerInstance {
  public:
   using KVPair = std::pair<std::string, std::string>;
   using ClusterInfo = std::vector<std::vector<std::string>>;
+  using Packet = std::vector<uint8_t>;
 
   struct ServerInfo {
     int rack_id;
@@ -40,7 +41,7 @@ class ServerInstance {
 
   void SetKvMigrationRing(struct rte_ring* ring);
   void CacheMigrate(const std::string_view& key, uint32_t migration_id);
-  void HandlePacket(const std::vector<uint8_t>& packet);
+  void HandlePacket(const Packet& packet);
 
  private:
   ServerInfo server_info_;
@@ -65,9 +66,9 @@ class ServerInstance {
 
   template <typename PayloadType>
   auto ConstructPacket(std::unique_ptr<PayloadType> payload, uint32_t dst_ip,
-                       uint32_t src_ip) -> std::vector<uint8_t>;
-  bool SendPacket(const std::vector<uint8_t>& packet);
-  void HandleMigrationInfo(const std::vector<uint8_t>& packet);
+                       uint32_t src_ip) -> Packet;
+  bool SendPacket(const Packet& packet);
+  void HandleMigrationInfo(const Packet& packet);
   auto HashToIps(const std::vector<uint32_t>& indices,
                  const std::vector<std::string>& ip_list)
       -> std::vector<std::pair<std::string, uint32_t>>;
@@ -75,5 +76,5 @@ class ServerInstance {
                                      uint16_t index, uint32_t migration_id,
                                      uint8_t dst_rack_id, uint16_t index_size)
       -> std::vector<uint8_t>;
-  void StartMigration(const std::vector<uint8_t>& packet);
+  void StartMigration(const Packet& packet);
 };
