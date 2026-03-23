@@ -78,7 +78,7 @@ void ServerInstance::CacheMigrate(const std::string_view& key,
 template <typename PayloadType>
 auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
                                      uint32_t dst_ip, uint32_t src_ip)
-    -> ServerInstance::Packet {
+    -> Packet {
   if (!payload) {
     throw std::invalid_argument("Payload cannot be null");
   }
@@ -203,7 +203,7 @@ auto ServerInstance::HashToIps(const std::vector<uint32_t>& indices,
 
 inline auto ServerInstance::ConstructMigratePacket(
     uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
-    uint8_t dst_rack_id, uint16_t index_size) -> ServerInstance::Packet {
+    uint8_t dst_rack_id, uint16_t index_size) -> Packet {
   size_t payload_size = sizeof(KVMigrate);
   size_t total_size = ETH_HLEN + IPV4_HDR_LEN + UDP_HDR_LEN + payload_size;
   Packet packet(total_size);

@@ -28,10 +28,9 @@
 #define UDP_PORT_MI 50001
 #define UDP_PORT_CM 50002
 
-// #define KEY_LENGTH 16
-// #define VALUE_LENGTH 4
-
 namespace c_m_proto {
+
+using Packet = std::vector<uint8_t>;
 
 constexpr size_t CACHE_SIZE = 310;
 constexpr size_t CHUNK_SIZE = 128;

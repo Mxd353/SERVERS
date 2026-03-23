@@ -131,7 +131,7 @@ void ServerCluster::ReceiveThread(
   int error_count = 0;
 
   while (!stop_receive_thread_.load(std::memory_order_relaxed)) {
-    ServerInstance::Packet buffer(BUFFER_SIZE);
+    Packet buffer(BUFFER_SIZE);
     ssize_t recvlen =
         recvfrom(sockfd_, buffer.data(), buffer.size(), MSG_DONTWAIT,
                  (struct sockaddr*)&src_addr, &addrlen);
