@@ -218,7 +218,7 @@ inline auto ServerInstance::ConstructMigratePacket(
   ip_hdr->ihl = 5;
   ip_hdr->version = 4;
   ip_hdr->tos = 0;
-  ip_hdr->tot_len = htons(total_size);
+  ip_hdr->tot_len = htons(total_size - RTE_ETHER_HDR_LEN);
   ip_hdr->id = htons(54321);
   ip_hdr->ttl = 64;
   ip_hdr->protocol = IPPROTO_UDP;

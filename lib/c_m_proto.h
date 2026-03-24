@@ -28,11 +28,6 @@
 #define UDP_PORT_MI 50001
 #define UDP_PORT_CM 50002
 
-#define DEV_SPINE 0
-#define DEV_LEAF 1
-#define DEV_CLIENT 2
-#define DEV_UNKNOWN 3
-
 namespace c_m_proto {
 
 using Packet = std::vector<uint8_t>;
@@ -44,6 +39,12 @@ constexpr size_t KEY_LENGTH = 16;
 constexpr size_t VALUE_LENGTH = 4;
 
 constexpr uint16_t RETRIES = 3;
+
+// DevType
+constexpr uint8_t DEV_SPINE = 0;
+constexpr uint8_t DEV_LEAF = 1;
+constexpr uint8_t DEV_CLIENT = 2;
+constexpr uint8_t DEV_UNKNOWN = 3;
 
 // op
 constexpr uint8_t READ_REQUEST = 0;
