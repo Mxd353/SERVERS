@@ -4,3 +4,4 @@ perf.data
 redis/confs/*
 *.log
 redis/pids/*
+.cache/

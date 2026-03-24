@@ -9,7 +9,7 @@
 #include <vector>
 
 #define ENCODE_DEV_INFO(dev_id, dev_type) \
-  (((dev_id & 0x1F) << 5) | ((dev_type & 0x07) << 2))
+  (((dev_id & 0x1F) << 3) | (dev_type & 0x07))
 
 #define GET_DEV_ID(dev_info) static_cast<uint8_t>(((dev_info) >> 3) & 0x1F)
 #define GET_DEV_TYPE(dev_info) static_cast<uint8_t>((dev_info) & 0x07)
@@ -27,6 +27,11 @@
 #define UDP_PORT_KV 50000
 #define UDP_PORT_MI 50001
 #define UDP_PORT_CM 50002
+
+#define DEV_SPINE 0
+#define DEV_LEAF 1
+#define DEV_CLIENT 2
+#define DEV_UNKNOWN 3
 
 namespace c_m_proto {
 
@@ -73,10 +78,13 @@ struct SockConfig {
 
 #pragma pack(push, 1)
 
-struct KVRequest {
-  uint8_t dev_info;  // dev_id (5 bits) | dev_type (3 bits)
+struct KVHeader {
+  uint8_t dev_info;
   uint32_t request_id = 0;
-  uint8_t combined;  // is_req(4 bit) | op(2 bit) | hot_query(2 bit)
+  uint8_t combined;
+};
+
+struct KVRequest : KVHeader {
   std::array<char, KEY_LENGTH> key{};
   std::array<char, VALUE_LENGTH> value1{};
   std::array<char, VALUE_LENGTH> value2{};
@@ -84,7 +92,7 @@ struct KVRequest {
   std::array<char, VALUE_LENGTH> value4{};
 };
 
-struct KVMigrate : public KVRequest {  // pick up from KVRequest
+struct KVMigrate : KVRequest {
   uint32_t migration_id = 0;
   uint8_t src_rack_id = 0;
   uint8_t dst_rack_id = 0;
@@ -111,6 +119,7 @@ struct CacheMigrate {
 constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
 constexpr uint16_t UDP_HDR_LEN = sizeof(rte_udp_hdr);
 constexpr uint16_t KV_HDR_LEN = sizeof(KVRequest);
+constexpr uint16_t KV_MIGRATE_HDR_LEN = sizeof(KVMigrate);
 constexpr uint16_t KV_HEADER_OFFSET =
     RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN;
 

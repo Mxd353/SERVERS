@@ -44,7 +44,7 @@ ServerInstance::ServerInstance(
 
 ServerInstance::~ServerInstance() {}
 
-void ServerInstance::SetKvMigrationRing(struct rte_ring* ring) {
+void ServerInstance::SetKvMigrationRing(rte_ring* ring) {
   kv_migration_ring_ = ring;
 }
 
@@ -90,13 +90,12 @@ auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
   size_t total_size = ETH_HLEN + IPV4_HDR_LEN + UDP_HDR_LEN + payload_size;
   Packet packet(total_size);
 
-  struct ethhdr* eth_hdr = reinterpret_cast<struct ethhdr*>(packet.data());
+  ethhdr* eth_hdr = reinterpret_cast<ethhdr*>(packet.data());
   memcpy(eth_hdr->h_dest, controller_info_->mac.data(), ETH_ALEN);
   memcpy(eth_hdr->h_source, server_info_.mac.data(), ETH_ALEN);
   eth_hdr->h_proto = htons(ETHERTYPE_IP);
 
-  struct iphdr* ip_hdr =
-      reinterpret_cast<struct iphdr*>(packet.data() + ETH_HLEN);
+  iphdr* ip_hdr = reinterpret_cast<iphdr*>(packet.data() + ETH_HLEN);
   ip_hdr->ihl = 5;
   ip_hdr->version = 4;
   ip_hdr->tos = 0;
@@ -108,8 +107,8 @@ auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
   ip_hdr->daddr = dst_ip;
   ip_hdr->check = Checksum(reinterpret_cast<uint16_t*>(ip_hdr), IPV4_HDR_LEN);
 
-  struct udphdr* udp_hdr =
-      reinterpret_cast<struct udphdr*>(packet.data() + ETH_HLEN + IPV4_HDR_LEN);
+  udphdr* udp_hdr =
+      reinterpret_cast<udphdr*>(packet.data() + ETH_HLEN + IPV4_HDR_LEN);
   udp_hdr->source = htons(src_port);
   udp_hdr->dest = htons(dst_port);
   udp_hdr->len = htons(UDP_HDR_LEN + payload_size);
@@ -127,10 +126,9 @@ bool ServerInstance::SendPacket(const Packet& packet) {
     return false;
   }
 
-  const struct ethhdr* eth_hdr =
-      reinterpret_cast<const struct ethhdr*>(packet.data());
+  const ethhdr* eth_hdr = reinterpret_cast<const ethhdr*>(packet.data());
 
-  struct sockaddr_ll dest_addr = {};
+  sockaddr_ll dest_addr = {};
   socklen_t addrlen = sizeof(dest_addr);
   memset(&dest_addr, 0, addrlen);
   dest_addr.sll_family = AF_PACKET;
@@ -138,9 +136,8 @@ bool ServerInstance::SendPacket(const Packet& packet) {
   dest_addr.sll_halen = ETH_ALEN;
   memcpy(dest_addr.sll_addr, eth_hdr->h_dest, ETH_ALEN);
 
-  ssize_t bytes_sent =
-      sendto(sock_config_->sockfd, packet.data(), packet.size(), 0,
-             (struct sockaddr*)&dest_addr, addrlen);
+  ssize_t bytes_sent = sendto(sock_config_->sockfd, packet.data(),
+                              packet.size(), 0, (sockaddr*)&dest_addr, addrlen);
   if (bytes_sent < 0) {
     perror("sendto failed");
     return false;
@@ -204,21 +201,20 @@ auto ServerInstance::HashToIps(const std::vector<uint32_t>& indices,
 inline auto ServerInstance::ConstructMigratePacket(
     uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
     uint8_t dst_rack_id, uint16_t index_size) -> Packet {
-  size_t payload_size = sizeof(KVMigrate);
-  size_t total_size = ETH_HLEN + IPV4_HDR_LEN + UDP_HDR_LEN + payload_size;
+  size_t total_size =
+      RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + KV_MIGRATE_HDR_LEN;
   Packet packet(total_size);
 
   uint8_t s_mac[ETH_ALEN];
   uint8_t d_mac[ETH_ALEN];
   rte_eth_random_addr(s_mac);
   rte_eth_random_addr(d_mac);
-  struct ethhdr* eth_hdr = reinterpret_cast<struct ethhdr*>(packet.data());
+  ethhdr* eth_hdr = reinterpret_cast<ethhdr*>(packet.data());
   memcpy(eth_hdr->h_source, s_mac, ETH_ALEN);
   memcpy(eth_hdr->h_dest, d_mac, ETH_ALEN);
   eth_hdr->h_proto = htons(ETHERTYPE_IP);
 
-  struct iphdr* ip_hdr =
-      reinterpret_cast<struct iphdr*>(packet.data() + ETH_HLEN);
+  iphdr* ip_hdr = reinterpret_cast<iphdr*>(packet.data() + ETH_HLEN);
   ip_hdr->ihl = 5;
   ip_hdr->version = 4;
   ip_hdr->tos = 0;
@@ -230,23 +226,26 @@ inline auto ServerInstance::ConstructMigratePacket(
   ip_hdr->daddr = dst_ip;
   ip_hdr->check = Checksum(reinterpret_cast<uint16_t*>(ip_hdr), IPV4_HDR_LEN);
 
-  struct udphdr* udp_hdr =
-      reinterpret_cast<struct udphdr*>(packet.data() + ETH_HLEN + IPV4_HDR_LEN);
+  udphdr* udp_hdr =
+      reinterpret_cast<udphdr*>(packet.data() + ETH_HLEN + IPV4_HDR_LEN);
   udp_hdr->source = htons(UDP_PORT_KV);
   udp_hdr->dest = htons(UDP_PORT_KV);
-  udp_hdr->len = htons(UDP_HDR_LEN + payload_size);
+  udp_hdr->len = htons(UDP_HDR_LEN + KV_MIGRATE_HDR_LEN);
   udp_hdr->check = 0;
 
-  struct KVMigrate* kv_migrate = reinterpret_cast<struct KVMigrate*>(
-      packet.data() + ETH_HLEN + IPV4_HDR_LEN);
+  KVMigrate* kv_migrate =
+      reinterpret_cast<KVMigrate*>(packet.data() + KV_HEADER_OFFSET);
+
+  auto rack_id = server_info_.rack_id;
+  kv_migrate->dev_info =
+      static_cast<uint8_t>(ENCODE_DEV_INFO(rack_id, DEV_LEAF));
   kv_migrate->request_id = utils::generate_request_id();
-  uint16_t combined = ENCODE_COMBINED(CACHE_MIGRATE, WRITE_REQUEST);
-  kv_migrate->combined = htons(combined);
+  kv_migrate->combined = ENCODE_COMBINED(CACHE_MIGRATE, WRITE_REQUEST);
   kv_migrate->migration_id = migration_id;
   kv_migrate->src_rack_id = server_info_.rack_id;
   kv_migrate->dst_rack_id = dst_rack_id;
-  kv_migrate->cache_index = htons(index);
-  kv_migrate->total_keys = htons(index_size);
+  kv_migrate->cache_index = index;
+  kv_migrate->total_keys = index_size;
 
   return packet;
 }

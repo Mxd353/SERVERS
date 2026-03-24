@@ -19,8 +19,8 @@ void ServerCluster::InitServers() {
     return;
   }
 
-  auto sock_config = std::make_shared<const SockConfig>(
-      SockConfig{sockfd_, ifindex_});
+  auto sock_config =
+      std::make_shared<const SockConfig>(SockConfig{sockfd_, ifindex_});
 
   for (size_t rack_idx = 0; rack_idx < clusters_info_.size(); ++rack_idx) {
     for (const auto& ip : clusters_info_[rack_idx]) {
@@ -73,7 +73,7 @@ bool ServerCluster::InitSocket() {
     throw std::runtime_error("Failed to set socket IP_HDRINCL");
   }
 
-  struct ifreq ifr;
+  ifreq ifr;
   memset(&ifr, 0, sizeof(ifr));
   snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s",
            controller_info_.iface.c_str());
@@ -126,26 +126,24 @@ void ServerCluster::ReceiveThread(
   constexpr int BUFFER_SIZE = 2048;
   constexpr int MAX_RETRIES = 5;
 
-  struct sockaddr_ll src_addr = {};
+  sockaddr_ll src_addr = {};
   socklen_t addrlen = sizeof(src_addr);
   int error_count = 0;
 
   while (!stop_receive_thread_.load(std::memory_order_relaxed)) {
     Packet buffer(BUFFER_SIZE);
-    ssize_t recvlen =
-        recvfrom(sockfd_, buffer.data(), buffer.size(), MSG_DONTWAIT,
-                 (struct sockaddr*)&src_addr, &addrlen);
+    ssize_t recvlen = recvfrom(sockfd_, buffer.data(), buffer.size(),
+                               MSG_DONTWAIT, (sockaddr*)&src_addr, &addrlen);
     if (recvlen > 0) {
       error_count = 0;
-      struct ethhdr* eth_hdr = reinterpret_cast<struct ethhdr*>(buffer.data());
+      ethhdr* eth_hdr = reinterpret_cast<ethhdr*>(buffer.data());
       if (memcmp(eth_hdr->h_source, src_mac_.data(), ETH_ALEN) == 0) continue;
       if (ntohs(eth_hdr->h_proto) != ETH_P_IP) continue;
       if (recvlen < ETH_HLEN + IPV4_HDR_LEN) {
         std::cerr << "[Recv] Packet too short: " << recvlen << " bytes.\n";
         continue;
       }
-      struct iphdr* ip_hdr =
-          reinterpret_cast<struct iphdr*>(buffer.data() + ETH_HLEN);
+      iphdr* ip_hdr = reinterpret_cast<iphdr*>(buffer.data() + ETH_HLEN);
 
       if (ip_hdr->saddr != inet_addr(controller_info_.ip.c_str())) continue;
 

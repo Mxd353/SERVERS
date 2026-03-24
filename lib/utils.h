@@ -18,7 +18,7 @@
 
 namespace utils {
 
-inline void monitor_mempool(struct rte_mempool *mp) {
+inline void monitor_mempool(rte_mempool* mp) {
   unsigned avail = rte_mempool_avail_count(mp);
   unsigned in_use = rte_mempool_in_use_count(mp);
   double use_percent = (double)in_use * 100.0 / (double)mp->size;
@@ -34,8 +34,8 @@ inline uint64_t get_now_micros() {
       .count();
 }
 
-inline void PrintHexData(const void *data, size_t size) {
-  unsigned char *byte_data = (unsigned char *)data;
+inline void PrintHexData(const void* data, size_t size) {
+  unsigned char* byte_data = (unsigned char*)data;
   for (size_t i = 0; i < size; ++i) {
     printf("%02x ", byte_data[i]);
     if ((i + 1) % 16 == 0) {
@@ -62,7 +62,7 @@ inline void PrintHexData(const void *data, size_t size) {
   printf("\n");
 }
 
-inline void ReverseRTE_IPV4(rte_be32_t ip, std::string &result) {
+inline void ReverseRTE_IPV4(rte_be32_t ip, std::string& result) {
   uint8_t a = (ip >> 24) & 0xFF;
   uint8_t b = (ip >> 16) & 0xFF;
   uint8_t c = (ip >> 8) & 0xFF;
@@ -78,14 +78,14 @@ inline std::string ReverseRTE_IPV4(rte_be32_t ip) {
   return result;
 }
 
-static inline void SwapIpv4(struct iphdr *ip_hdr) {
+static inline void SwapIpv4(struct iphdr* ip_hdr) {
   uint32_t tmp_ip = ip_hdr->saddr;
   ip_hdr->saddr = ip_hdr->daddr;
   ip_hdr->daddr = tmp_ip;
 }
 
-inline void ParseMac(const std::string &mac_str,
-                     std::array<uint8_t, ETH_ALEN> &mac_bytes) {
+inline void ParseMac(const std::string& mac_str,
+                     std::array<uint8_t, ETH_ALEN>& mac_bytes) {
   std::istringstream iss(mac_str);
   std::string byte_str;
   int i = 0;
@@ -94,7 +94,7 @@ inline void ParseMac(const std::string &mac_str,
   }
 }
 
-inline std::array<uint8_t, ETH_ALEN> ParseMac(const std::string &mac_str) {
+inline std::array<uint8_t, ETH_ALEN> ParseMac(const std::string& mac_str) {
   std::array<uint8_t, ETH_ALEN> mac_bytes{};
   ParseMac(mac_str, mac_bytes);
   return mac_bytes;

@@ -243,12 +243,12 @@ int DPDKHandler::PortInit() {
   return 0;
 }
 
-inline int DPDKHandler::LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
-                                     uint8_t& db_out) {
+inline int DPDKHandler::LookupWorker(rte_be32_t ip_be, uint16_t& worker_out,
+                                     uint16_t& db_out) {
   uint32_t ip = rte_be_to_cpu_32(ip_be);
 
-  uint8_t rack = static_cast<uint8_t>((ip >> 8) & 0xFF);  // subnet
-  uint8_t host = static_cast<uint8_t>(ip & 0xFF);         // host
+  uint8_t rack = static_cast<uint8_t>((ip >> 8) & 0xFF);
+  uint8_t host = static_cast<uint8_t>(ip & 0xFF);
 
   if (unlikely(rack >= worker_table.size() || host == 0 || host > DB_PER_RACK))
     return -1;
@@ -256,7 +256,8 @@ inline int DPDKHandler::LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
   worker_out = worker_table[rack];
   db_out = rack * DB_PER_RACK + (host - 1);
 
-  if (unlikely(worker_out == 0xFF || db_out >= TOTAL_DB_NUM)) return -1;
+  if (unlikely(worker_out >= WORKER_CORE_NUM || db_out >= TOTAL_DB_NUM))
+    return -1;
 
   return 0;
 }
@@ -316,7 +317,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           SwapMac(eth_hdr);
           rte_be32_t ip_be = SwapIpv4(ip_hdr);
 
-          uint8_t worker_id, db_id;
+          uint16_t worker_id, db_id;
           if (LookupWorker(ip_be, worker_id, db_id) != 0) {
             rte_pktmbuf_free(rx_pkts[i]);
             RTE_LOG(WARNING, DB,
@@ -328,6 +329,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           ipc_req* req;
           if (rte_mempool_get(ipc_mempool_, (void**)&req) == 0) {
             req->db_id = db_id;
+            req->src_ip = ip_be;
             req->mbuf = rx_pkts[i];
             if (unlikely(rte_ring_mp_enqueue((*rx_rings)[worker_id], req) <
                          0)) {
@@ -461,15 +463,30 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
         auto* kv_hdr =
             rte_pktmbuf_mtod_offset(req->mbuf, KVRequest*, KV_HEADER_OFFSET);
-        kv_hdr->combined |= 0x1000;
+
+        uint8_t is_req = GET_IS_REQ(kv_hdr->combined);
 
         std::string_view key(kv_hdr->key.data(), KEY_LENGTH);
 
         if (GET_OP(kv_hdr->combined) == WRITE_REQUEST) {
           std::string_view value(kv_hdr->value1.data(), VALUE_LENGTH * 4);
           pipeline.write_req.push("SET", key, value);
+
+          if (is_req == CACHE_MIGRATE) {
+            auto* kv_migrate = rte_pktmbuf_mtod_offset(req->mbuf, KVMigrate*,
+                                                       KV_HEADER_OFFSET);
+            auto server_instance = GetServerByIp(req->src_ip);
+            if (server_instance) {
+              server_instance->CacheMigrate(key, kv_migrate->migration_id);
+            }
+            rte_pktmbuf_free(req->mbuf);
+            continue;
+          }
+
+          kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
           pipeline.write_mbufs.push_back(req->mbuf);
         } else {
+          kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
           pipeline.read_req.push("GET", key);
           pipeline.read_mbufs.push_back(req->mbuf);
         }

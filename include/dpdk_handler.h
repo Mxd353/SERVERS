@@ -96,7 +96,8 @@ class DPDKHandler {
   };
 
   struct ipc_req {
-    uint8_t db_id;
+    uint16_t db_id;
+    rte_be32_t src_ip;
     rte_mbuf* mbuf;
   };
 
@@ -105,8 +106,8 @@ class DPDKHandler {
   static inline void SwapMac(rte_ether_hdr* eth_hdr);
   static inline rte_be32_t SwapIpv4(rte_ipv4_hdr* ip_hdr);
   int PortInit();
-  inline int LookupWorker(rte_be32_t ip_be, uint8_t& worker_out,
-                          uint8_t& db_out);
+  inline int LookupWorker(rte_be32_t ip_be, uint16_t& worker_out,
+                          uint16_t& db_out);
   void RxLoop(CoreInfo core_info);
   void TxLoop(CoreInfo core_info);
   void DBWorker(CoreInfo core_info);
