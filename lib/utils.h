@@ -10,13 +10,91 @@
 #include <chrono>
 #include <climits>
 #include <iostream>
+#include <iterator>
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 namespace utils {
+
+template <typename T>
+class Range {
+ public:
+  class Iterator {
+   public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const T*;
+    using reference = const T&;
+
+    Iterator(T value, T stop, T step)
+        : value_(value), stop_(stop), step_(step) {}
+
+    T operator*() const { return value_; }
+
+    Iterator& operator++() {
+      value_ += step_;
+      return *this;
+    }
+
+    Iterator operator++(int) {
+      Iterator tmp = *this;
+      ++(*this);
+      return tmp;
+    }
+
+    bool operator==(const Iterator& other) const {
+      if (step_ > 0) {
+        return value_ >= other.value_;
+      } else {
+        return value_ <= other.value_;
+      }
+    }
+
+    bool operator!=(const Iterator& other) const { return !(*this == other); }
+
+   private:
+    T value_;
+    T stop_;
+    T step_;
+  };
+
+  Range(T stop) : start_(0), stop_(stop), step_(1) {
+    if (stop_ < 0) stop_ = 0;
+  }
+
+  Range(T start, T stop, T step = 1) : start_(start), stop_(stop), step_(step) {
+    if (step == 0) {
+      throw std::invalid_argument("step cannot be zero");
+    }
+  }
+
+  Iterator begin() const { return Iterator(start_, stop_, step_); }
+
+  Iterator end() const { return Iterator(stop_, stop_, step_); }
+
+ private:
+  T start_;
+  T stop_;
+  T step_;
+};
+
+template <typename T>
+Range<T> range(T stop) {
+  return Range<T>(stop);
+}
+
+template <typename T1, typename T2, typename T3 = T2>
+auto range(T1 start, T2 stop, T3 step = 1)
+    -> Range<std::common_type_t<T1, T2, T3>> {
+  using CommonType = std::common_type_t<T1, T2, T3>;
+  return Range<CommonType>(start, stop, step);
+}
 
 inline void monitor_mempool(rte_mempool* mp) {
   unsigned avail = rte_mempool_avail_count(mp);
@@ -36,11 +114,11 @@ inline uint64_t get_now_micros() {
 
 inline void PrintHexData(const void* data, size_t size) {
   unsigned char* byte_data = (unsigned char*)data;
-  for (size_t i = 0; i < size; ++i) {
+  for (auto i : range(size)) {
     printf("%02x ", byte_data[i]);
     if ((i + 1) % 16 == 0) {
       printf("  ");
-      for (size_t j = i - 15; j <= i; ++j) {
+      for (auto j : range(i - 15, i)) {
         printf("%c", (byte_data[j] >= 32 && byte_data[j] <= 126) ? byte_data[j]
                                                                  : '.');
       }
@@ -53,7 +131,7 @@ inline void PrintHexData(const void* data, size_t size) {
       printf("   ");
     }
     printf("  ");
-    for (size_t i = size - remaining; i < size; ++i) {
+    for (auto i : range(size - remaining, size)) {
       printf("%c",
              (byte_data[i] >= 32 && byte_data[i] <= 126) ? byte_data[i] : '.');
     }

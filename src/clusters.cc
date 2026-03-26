@@ -22,7 +22,7 @@ void ServerCluster::InitServers() {
   auto sock_config =
       std::make_shared<const SockConfig>(SockConfig{sockfd_, ifindex_});
 
-  for (size_t rack_idx = 0; rack_idx < clusters_info_.size(); ++rack_idx) {
+  for (auto rack_idx : utils::range(clusters_info_.size())) {
     for (const auto& ip : clusters_info_[rack_idx]) {
       ServerInstance::ServerInfo server_info = {static_cast<int>(rack_idx), ip,
                                                 src_mac_, db++};

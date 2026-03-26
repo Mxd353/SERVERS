@@ -29,6 +29,8 @@ TX lcore
 
 namespace redis = boost::redis;
 
+using namespace utils;
+
 std::atomic<uint64_t> total_latency_us{0};
 std::atomic<size_t> completed_request_count{0};
 std::atomic<uint32_t> next_db_id{0};
@@ -291,7 +293,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
         rte_pause();
         continue;
       } else {
-        for (uint16_t i = 0; i < nb_rx; i++) {
+        for (auto i : range(nb_rx)) {
           if (i + 2 < nb_rx)
             rte_prefetch0(rte_pktmbuf_mtod(rx_pkts[i + 2], void*));
 
@@ -368,7 +370,7 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
       uint16_t nb_sent = rte_eth_tx_burst(port, queue_id, tx_pkts, nb_pkts);
 
       if (unlikely(nb_sent < nb_pkts)) {
-        for (uint16_t i = nb_sent; i < nb_pkts; i++) {
+        for (auto i : range(nb_sent, nb_pkts)) {
           rte_pktmbuf_free(tx_pkts[i]);
         }
       }
@@ -403,7 +405,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   std::vector<std::shared_ptr<redis::connection>> conns;
   conns.reserve(db_count);
 
-  for (uint32_t i = 0; i < DBS_PER_WORKER; ++i) {
+  for (auto i : range(db_count)) {
     redis::config cfg;
     cfg.addr.host = "127.0.0.1";
     cfg.addr.port = std::to_string(i + start_db);
@@ -448,7 +450,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         rte_ring_sc_dequeue_bulk(rx_ring, (void**)reqs, BURST_SIZE, nullptr);
 
     if (nb_rx > 0) {
-      for (uint16_t i = 0; i < nb_rx; ++i) {
+      for (auto i : range(nb_rx)) {
         auto& req = reqs[i];
 
         const uint32_t db_idx = req->db_id - start_db;
@@ -518,7 +520,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
                     tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
                     mbufs.size(), nullptr);
                 if (ret < mbufs.size()) {
-                  for (size_t i = ret; i < mbufs.size(); ++i) {
+                  for (auto i : range(ret, mbufs.size())) {
                     rte_pktmbuf_free(mbufs[i]);
                   }
                 }
@@ -569,7 +571,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
                     tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
                     mbufs.size(), nullptr);
                 if (ret < mbufs.size()) {
-                  for (size_t i = ret; i < mbufs.size(); ++i)
+                  for (auto i : range(ret, mbufs.size()))
                     rte_pktmbuf_free(mbufs[i]);
                 }
               });
@@ -584,7 +586,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 }
 
 inline void DPDKHandler::CreatRings() {
-  for (uint32_t i = 0; i < RX_CORE_NUM; i++) {
+  for (auto i : range(RX_CORE_NUM)) {
     char ring_name[32];
     snprintf(ring_name, sizeof(ring_name), "rx_ring_%d", i);
     rx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
@@ -594,7 +596,7 @@ inline void DPDKHandler::CreatRings() {
     }
   }
 
-  for (uint32_t i = 0; i < TX_CORE_NUM; i++) {
+  for (auto i : range(TX_CORE_NUM)) {
     char ring_name[32];
     snprintf(ring_name, sizeof(ring_name), "tx_ring_%d", i);
     tx_rings_[i] = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(),
@@ -731,7 +733,7 @@ inline void DPDKHandler::LaunchThreads() {
 void DPDKHandler::Start() {
   uint16_t port = 0;
 
-  for (uint32_t rack = 0; rack < NUM_RACKS; ++rack) {
+  for (auto rack : range(NUM_RACKS)) {
     worker_table[rack] = rack / RACK_PER_WORKER;
   }
 
@@ -752,10 +754,10 @@ void DPDKHandler::Start() {
   LaunchThreads();
 
   while (true) {
-    utils::monitor_mempool(rx_mbufpool_);
-    utils::monitor_mempool(tx_mbufpool_);
+    monitor_mempool(rx_mbufpool_);
+    monitor_mempool(tx_mbufpool_);
 
-    for (size_t i = 0; i < RX_CORE_NUM; ++i)
+    for (auto i : range(RX_CORE_NUM))
       std::cout << rte_eth_rx_queue_count(port, i) << " | ";
     std::cout << std::endl;
 
