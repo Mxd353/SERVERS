@@ -77,8 +77,9 @@ void ServerInstance::CacheMigrate(const std::string_view& key,
 
 template <typename PayloadType>
 auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
-                                     uint32_t dst_ip, uint32_t src_ip)
-    -> Packet {
+                                     uint32_t dst_ip, uint32_t src_ip,
+                                     const uint8_t* dst_mac,
+                                     const uint8_t* src_mac) -> Packet {
   if (!payload) {
     throw std::invalid_argument("Payload cannot be null");
   }
@@ -90,9 +91,12 @@ auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
   size_t total_size = ETH_HLEN + IPV4_HDR_LEN + UDP_HDR_LEN + payload_size;
   Packet packet(total_size);
 
+  const uint8_t* d_mac = dst_mac ? dst_mac : controller_info_->mac.data();
+  const uint8_t* s_mac = src_mac ? src_mac : server_info_.mac.data();
+
   ethhdr* eth_hdr = reinterpret_cast<ethhdr*>(packet.data());
-  memcpy(eth_hdr->h_dest, controller_info_->mac.data(), ETH_ALEN);
-  memcpy(eth_hdr->h_source, server_info_.mac.data(), ETH_ALEN);
+  memcpy(eth_hdr->h_dest, d_mac, ETH_ALEN);
+  memcpy(eth_hdr->h_source, s_mac, ETH_ALEN);
   eth_hdr->h_proto = htons(ETHERTYPE_IP);
 
   iphdr* ip_hdr = reinterpret_cast<iphdr*>(packet.data() + ETH_HLEN);
@@ -201,44 +205,14 @@ auto ServerInstance::HashToIps(const std::vector<uint32_t>& indices,
 inline auto ServerInstance::ConstructMigratePacket(
     uint32_t dst_ip, uint32_t src_ip, uint16_t index, uint32_t migration_id,
     uint8_t dst_rack_id, uint16_t index_size) -> Packet {
-  size_t total_size =
-      RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + KV_MIGRATE_HDR_LEN;
-  Packet packet(total_size);
-
   uint8_t s_mac[ETH_ALEN];
   uint8_t d_mac[ETH_ALEN];
   rte_eth_random_addr(s_mac);
   rte_eth_random_addr(d_mac);
-  ethhdr* eth_hdr = reinterpret_cast<ethhdr*>(packet.data());
-  memcpy(eth_hdr->h_source, s_mac, ETH_ALEN);
-  memcpy(eth_hdr->h_dest, d_mac, ETH_ALEN);
-  eth_hdr->h_proto = htons(ETHERTYPE_IP);
 
-  iphdr* ip_hdr = reinterpret_cast<iphdr*>(packet.data() + ETH_HLEN);
-  ip_hdr->ihl = 5;
-  ip_hdr->version = 4;
-  ip_hdr->tos = 0;
-  ip_hdr->tot_len = htons(total_size - RTE_ETHER_HDR_LEN);
-  ip_hdr->id = htons(54321);
-  ip_hdr->ttl = 64;
-  ip_hdr->protocol = IPPROTO_UDP;
-  ip_hdr->saddr = src_ip;
-  ip_hdr->daddr = dst_ip;
-  ip_hdr->check = Checksum(reinterpret_cast<uint16_t*>(ip_hdr), IPV4_HDR_LEN);
-
-  udphdr* udp_hdr =
-      reinterpret_cast<udphdr*>(packet.data() + ETH_HLEN + IPV4_HDR_LEN);
-  udp_hdr->source = htons(UDP_PORT_KV);
-  udp_hdr->dest = htons(UDP_PORT_KV);
-  udp_hdr->len = htons(UDP_HDR_LEN + KV_MIGRATE_HDR_LEN);
-  udp_hdr->check = 0;
-
-  KVMigrate* kv_migrate =
-      reinterpret_cast<KVMigrate*>(packet.data() + KV_HEADER_OFFSET);
-
-  auto rack_id = server_info_.rack_id;
+  auto kv_migrate = std::make_unique<KVMigrate>();
   kv_migrate->dev_info =
-      static_cast<uint8_t>(ENCODE_DEV_INFO(rack_id, DEV_LEAF));
+      static_cast<uint8_t>(ENCODE_DEV_INFO(server_info_.rack_id, DEV_LEAF));
   kv_migrate->request_id = utils::generate_request_id();
   kv_migrate->combined = ENCODE_COMBINED(CACHE_MIGRATE, WRITE_REQUEST);
   kv_migrate->migration_id = migration_id;
@@ -247,7 +221,7 @@ inline auto ServerInstance::ConstructMigratePacket(
   kv_migrate->cache_index = index;
   kv_migrate->total_keys = index_size;
 
-  return packet;
+  return ConstructPacket(std::move(kv_migrate), dst_ip, src_ip, d_mac, s_mac);
 }
 
 void ServerInstance::StartMigration(const Packet& packet) {

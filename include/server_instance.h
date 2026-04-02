@@ -65,7 +65,8 @@ class ServerInstance {
 
   template <typename PayloadType>
   auto ConstructPacket(std::unique_ptr<PayloadType> payload, uint32_t dst_ip,
-                       uint32_t src_ip) -> c_m_proto::Packet;
+                       uint32_t src_ip, const uint8_t* dst_mac = nullptr,
+                       const uint8_t* src_mac = nullptr) -> c_m_proto::Packet;
   bool SendPacket(const c_m_proto::Packet& packet);
   void HandleMigrationInfo(const c_m_proto::Packet& packet);
   auto HashToIps(const std::vector<uint32_t>& indices,
