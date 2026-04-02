@@ -90,7 +90,7 @@ bool DPDKHandler::Initialize(
 
   kv_migration_ring =
       rte_ring_create("kv_migration_ring", RING_SIZE, rte_socket_id(),
-                      RING_F_SC_DEQ | RING_F_MP_RTS_ENQ);
+                      RING_F_MP_RTS_ENQ | RING_F_MC_RTS_DEQ);
   if (kv_migration_ring == nullptr) {
     rte_exit(EXIT_FAILURE, "Cannot create kv_migration_ring\n");
   }
@@ -363,7 +363,7 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 
   while (true) {
     // 1. 处理缓存迁移 ring
-    uint16_t nb_mig = rte_ring_sc_dequeue_burst(
+    uint16_t nb_mig = rte_ring_mc_dequeue_burst(
         kv_migration_ring, reinterpret_cast<void**>(mig_packets), BURST_SIZE, nullptr);
 
     if (likely(nb_mig > 0)) {
