@@ -5,10 +5,8 @@ set(HOME_DIR $ENV{HOME})
 if(EXISTS "${HOME_DIR}/gcc/bin/gcc" AND EXISTS "${HOME_DIR}/gcc/bin/g++")
     set(CMAKE_C_COMPILER "${HOME_DIR}/gcc/bin/gcc")
     set(CMAKE_CXX_COMPILER "${HOME_DIR}/gcc/bin/g++")
-elseif(EXISTS "/usr/bin/g++-13")
-    set(CMAKE_C_COMPILER "/usr/bin/gcc-13")
-    set(CMAKE_CXX_COMPILER "/usr/bin/g++-13")
 endif()
+
 
 project(ClusterRun
     VERSION 1.0
@@ -20,9 +18,18 @@ project(ClusterRun
 
 # option(USE_FEATURE_X "Enable feature X" OFF)
 
+enable_language(C)
+enable_language(CXX)
+
+message(STATUS "GCC C Compiler: ${CMAKE_C_COMPILER_VERSION}")
+message(STATUS "GCC C++ Compiler: ${CMAKE_CXX_COMPILER_VERSION}")
+
 set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 
 add_subdirectory(lib/arp)
+
+# Define ARP module path for C++ code
+add_compile_definitions(ARP_MODULE_PATH="${ARP_MODULE_PATH}")
 
 message(STATUS "HOME_DIR = ${HOME_DIR}")
 
