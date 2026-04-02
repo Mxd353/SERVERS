@@ -86,13 +86,11 @@ auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
   eth_hdr->h_proto = htons(ETHERTYPE_IP);
 
   iphdr* ip_hdr = reinterpret_cast<iphdr*>(packet.data() + ETH_HLEN);
-  ip_hdr->ihl = IP_DEFAULT_IHL;
-  ip_hdr->version = IP_DEFAULT_VERSION;
-  ip_hdr->tos = IP_DEFAULT_TOS;
-  ip_hdr->tot_len = htons(total_size);
-  ip_hdr->id = htons(IP_DEFAULT_ID);
-  ip_hdr->ttl = IP_DEFAULT_TTL;
+  static const iphdr default_hdr = CreateDefaultIpHdr();
+  *ip_hdr = default_hdr;  // 整段复制默认模板
+  // 修改特定值
   ip_hdr->protocol = protocol;
+  ip_hdr->tot_len = htons(total_size);
   ip_hdr->saddr = src_ip;
   ip_hdr->daddr = dst_ip;
   ip_hdr->check = utils::IpChecksum(reinterpret_cast<uint16_t*>(ip_hdr), IPV4_HDR_LEN);

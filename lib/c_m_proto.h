@@ -135,6 +135,19 @@ constexpr uint16_t IP_DEFAULT_ID = 54321;
 constexpr uint8_t IP_DEFAULT_TTL = 64;
 constexpr uint8_t IP_DEFAULT_PROTOCOL = IPPROTO_UDP;
 
+// 创建默认 IP 头部（静态模板，用于整段复制）
+inline iphdr CreateDefaultIpHdr() {
+  iphdr hdr{};
+  hdr.ihl = IP_DEFAULT_IHL;
+  hdr.version = IP_DEFAULT_VERSION;
+  hdr.tos = IP_DEFAULT_TOS;
+  hdr.id = htons(IP_DEFAULT_ID);
+  hdr.ttl = IP_DEFAULT_TTL;
+  hdr.protocol = IP_DEFAULT_PROTOCOL;
+  // tot_len, frag_off, saddr, daddr, check 在复制后设置
+  return hdr;
+}
+
 template <typename PayloadType>
 struct PacketTraits {
   static constexpr uint8_t Protocol = IPPROTO_UDP;
