@@ -25,6 +25,7 @@
 #define RX_RING_SIZE 2048
 #define TX_RING_SIZE 1024
 #define SAFETY_FACTOR 1.5
+#define DB_BASE_PORT 6380
 
 constexpr uint32_t RX_CORE_NUM = 8;
 constexpr uint32_t WORKER_CORE_NUM = RX_CORE_NUM;

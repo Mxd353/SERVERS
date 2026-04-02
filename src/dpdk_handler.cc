@@ -407,11 +407,14 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
   for (auto i : range(db_count)) {
     redis::config cfg;
-    cfg.addr.host = "127.0.0.1";
-    cfg.addr.port = std::to_string(i + start_db);
+    // cfg.addr.host = "127.0.0.1";
+    // cfg.addr.port = std::to_string(i + start_db + DB_BASE_PORT);
 
-    auto conn = std::make_shared<redis::connection>(ioc.get_executor());
-    conn->async_run(cfg, {}, net::detached);
+    std::string db_socket = std::to_string(i + start_db);
+    cfg.unix_socket = "/tmp/redis." + db_socket;
+    redis::logger l;
+    auto conn = std::make_shared<redis::connection>(ioc.get_executor(), l);
+    conn->async_run(cfg, net::consign(net::detached, conn));
     conns.push_back(conn);
   }
 

@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 4.0)
 
+# Set compiler before project()
+set(HOME_DIR $ENV{HOME})
+if(EXISTS "${HOME_DIR}/gcc/bin/gcc" AND EXISTS "${HOME_DIR}/gcc/bin/g++")
+    set(CMAKE_C_COMPILER "${HOME_DIR}/gcc/bin/gcc")
+    set(CMAKE_CXX_COMPILER "${HOME_DIR}/gcc/bin/g++")
+elseif(EXISTS "/usr/bin/g++-13")
+    set(CMAKE_C_COMPILER "/usr/bin/gcc-13")
+    set(CMAKE_CXX_COMPILER "/usr/bin/g++-13")
+endif()
+
 project(ClusterRun
     VERSION 1.0
     DESCRIPTION "Cluter Run"
@@ -14,16 +24,7 @@ set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 
 add_subdirectory(lib/arp)
 
-set(HOME_DIR $ENV{HOME})
 message(STATUS "HOME_DIR = ${HOME_DIR}")
-
-if(EXISTS "${HOME_DIR}/gcc/bin/gcc" AND EXISTS "${HOME_DIR}/gcc/bin/g++")
-    set(CMAKE_C_COMPILER "${HOME_DIR}/gcc/bin/gcc")
-    set(CMAKE_CXX_COMPILER "${HOME_DIR}/gcc/bin/g++")
-elseif(EXISTS "/usr/bin/g++-13")
-    set(CMAKE_C_COMPILER "/usr/bin/gcc-13")
-    set(CMAKE_CXX_COMPILER "/usr/bin/g++-13")
-endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,7 +81,7 @@ if(EXISTS "${HOME_DIR}/lib/boost")
     set(BOOST_ROOT "${HOME_DIR}/lib/boost")
     set(Boost_NO_SYSTEM_PATHS ON)
 endif()
-find_package(Boost REQUIRED COMPONENTS system)
+find_package(Boost 1.90.0 REQUIRED)
 if(Boost_FOUND)
     message(STATUS "Boost found: ${Boost_VERSION}")
     message(STATUS "Boost include dir: ${Boost_INCLUDE_DIRS}")
@@ -137,7 +138,7 @@ target_link_libraries(${TARGET_NAME}
     PUBLIC
         OpenSSL::SSL
         OpenSSL::Crypto
-        Boost::system
+        ${Boost_LIBRARIES}
         TBB::tbb
         Threads::Threads
         Python3::Python

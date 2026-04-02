@@ -118,7 +118,7 @@ inline void PrintHexData(const void* data, size_t size) {
     printf("%02x ", byte_data[i]);
     if ((i + 1) % 16 == 0) {
       printf("  ");
-      for (auto j : range(i - 15, i)) {
+      for (auto j : range(i - 15, i + 1)) {
         printf("%c", (byte_data[j] >= 32 && byte_data[j] <= 126) ? byte_data[j]
                                                                  : '.');
       }
