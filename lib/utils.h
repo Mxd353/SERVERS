@@ -1,6 +1,7 @@
 #pragma once
 
 #include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <netinet/ip.h>
 #include <rte_byteorder.h>
 
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cstring>
 #include <iostream>
 #include <iterator>
 #include <numeric>
@@ -195,7 +197,7 @@ static inline uint32_t generate_request_id() {
 }
 
 static inline std::vector<uint> SampleIndices(uint base, uint limit,
-                                              size_t sample_size) {
+                                               size_t sample_size) {
   std::vector<uint> indices(limit - base);
   indices.reserve(sample_size);
   std::iota(indices.begin(), indices.end(), base);
@@ -208,6 +210,34 @@ static inline std::vector<uint> SampleIndices(uint base, uint limit,
   }
 
   return std::vector<uint>(indices.begin(), indices.begin() + sample_size);
+}
+
+// IP Checksum calculation for raw packets
+static inline uint16_t IpChecksum(uint16_t* buffer, int size) {
+  unsigned long sum = 0;
+  while (size > 1) {
+    sum += *buffer++;
+    size -= 2;
+  }
+  if (size > 0) {
+    sum += htons(*(uint8_t*)buffer << 8);
+  }
+  sum = (sum >> 16) + (sum & 0xFFFF);
+  sum += (sum >> 16);
+  return static_cast<uint16_t>(~sum);
+}
+
+// Helper to construct sockaddr_ll for raw packet sending
+static inline sockaddr_ll MakeSockAddrLl(int ifindex,
+                                          const uint8_t* dst_mac) {
+  sockaddr_ll addr = {};
+  addr.sll_family = AF_PACKET;
+  addr.sll_ifindex = ifindex;
+  addr.sll_halen = ETH_ALEN;
+  if (dst_mac) {
+    memcpy(addr.sll_addr, dst_mac, ETH_ALEN);
+  }
+  return addr;
 }
 
 }  // namespace utils

@@ -12,20 +12,6 @@
 
 using namespace c_m_proto;
 
-static inline uint16_t Checksum(uint16_t* buffer, int size) {
-  unsigned long sum = 0;
-  while (size > 1) {
-    sum += *buffer++;
-    size -= 2;
-  }
-  if (size > 0) {
-    sum += htons(*(uint8_t*)buffer << 8);
-  }
-  sum = (sum >> 16) + (sum & 0xFFFF);
-  sum += (sum >> 16);
-  return static_cast<uint16_t>(~sum);
-}
-
 ServerInstance::ServerInstance(
     const ServerInfo& server_info,
     std::shared_ptr<const SockConfig> sock_config,
@@ -100,16 +86,16 @@ auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
   eth_hdr->h_proto = htons(ETHERTYPE_IP);
 
   iphdr* ip_hdr = reinterpret_cast<iphdr*>(packet.data() + ETH_HLEN);
-  ip_hdr->ihl = 5;
-  ip_hdr->version = 4;
-  ip_hdr->tos = 0;
+  ip_hdr->ihl = IP_DEFAULT_IHL;
+  ip_hdr->version = IP_DEFAULT_VERSION;
+  ip_hdr->tos = IP_DEFAULT_TOS;
   ip_hdr->tot_len = htons(total_size);
-  ip_hdr->id = htons(54321);
-  ip_hdr->ttl = 64;
+  ip_hdr->id = htons(IP_DEFAULT_ID);
+  ip_hdr->ttl = IP_DEFAULT_TTL;
   ip_hdr->protocol = protocol;
   ip_hdr->saddr = src_ip;
   ip_hdr->daddr = dst_ip;
-  ip_hdr->check = Checksum(reinterpret_cast<uint16_t*>(ip_hdr), IPV4_HDR_LEN);
+  ip_hdr->check = utils::IpChecksum(reinterpret_cast<uint16_t*>(ip_hdr), IPV4_HDR_LEN);
 
   udphdr* udp_hdr =
       reinterpret_cast<udphdr*>(packet.data() + ETH_HLEN + IPV4_HDR_LEN);
@@ -125,23 +111,19 @@ auto ServerInstance::ConstructPacket(std::unique_ptr<PayloadType> payload,
 }
 
 bool ServerInstance::SendPacket(const Packet& packet) {
-  if (packet.size() < IPV4_HDR_LEN) {
-    std::cerr << "Packet too small to extract IP header." << std::endl;
+  if (packet.size() < ETH_HLEN + IPV4_HDR_LEN) {
+    std::cerr << "Packet too small to extract headers." << std::endl;
     return false;
   }
 
   const ethhdr* eth_hdr = reinterpret_cast<const ethhdr*>(packet.data());
-
-  sockaddr_ll dest_addr = {};
-  socklen_t addrlen = sizeof(dest_addr);
-  memset(&dest_addr, 0, addrlen);
-  dest_addr.sll_family = AF_PACKET;
-  dest_addr.sll_ifindex = sock_config_->ifindex;
-  dest_addr.sll_halen = ETH_ALEN;
-  memcpy(dest_addr.sll_addr, eth_hdr->h_dest, ETH_ALEN);
+  sockaddr_ll dest_addr = utils::MakeSockAddrLl(sock_config_->ifindex,
+                                                eth_hdr->h_dest);
 
   ssize_t bytes_sent = sendto(sock_config_->sockfd, packet.data(),
-                              packet.size(), 0, (sockaddr*)&dest_addr, addrlen);
+                              packet.size(), 0,
+                              reinterpret_cast<sockaddr*>(&dest_addr),
+                              sizeof(dest_addr));
   if (bytes_sent < 0) {
     perror("sendto failed");
     return false;

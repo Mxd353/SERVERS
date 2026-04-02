@@ -127,6 +127,14 @@ constexpr uint16_t KV_HEADER_OFFSET =
 const uint16_t TOTAL_LEN =
     RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + KV_HDR_LEN;
 
+// IP Header defaults
+constexpr uint8_t IP_DEFAULT_IHL = 5;
+constexpr uint8_t IP_DEFAULT_VERSION = 4;
+constexpr uint8_t IP_DEFAULT_TOS = 0;
+constexpr uint16_t IP_DEFAULT_ID = 54321;
+constexpr uint8_t IP_DEFAULT_TTL = 64;
+constexpr uint8_t IP_DEFAULT_PROTOCOL = IPPROTO_UDP;
+
 template <typename PayloadType>
 struct PacketTraits {
   static constexpr uint8_t Protocol = IPPROTO_UDP;
