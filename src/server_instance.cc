@@ -232,6 +232,7 @@ void ServerInstance::StartMigration(const Packet& packet) {
     if (ret < 0) {
       std::cerr << "Failed to enqueue migration packet to ring: " << ret
                 << std::endl;
+      delete packet_data;  // 释放内存防止泄漏
       continue;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

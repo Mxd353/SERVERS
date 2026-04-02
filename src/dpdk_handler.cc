@@ -348,6 +348,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
 }
 
 void DPDKHandler::TxLoop(CoreInfo core_info) {
+  using namespace c_m_proto;
   const uint16_t port = 0;
 
   uint lcore_id = core_info.lcore_id;
@@ -358,15 +359,54 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
           queue_id);
 
   rte_mbuf* tx_pkts[BURST_SIZE];
+  Packet* mig_packets[BURST_SIZE];
 
   while (true) {
+    // 1. 处理缓存迁移 ring
+    uint16_t nb_mig = rte_ring_sc_dequeue_burst(
+        kv_migration_ring, reinterpret_cast<void**>(mig_packets), BURST_SIZE, nullptr);
+
+    if (likely(nb_mig > 0)) {
+      uint16_t mig_sent = 0;
+      for (auto i : range(nb_mig)) {
+        Packet* packet = mig_packets[i];
+        if (unlikely(packet->size() > TX_MBUF_DATA_SIZE)) {
+          RTE_LOG(WARNING, CORE, "[TX Core %u] Migration packet too large: %zu\n",
+                  lcore_id, packet->size());
+          delete packet;
+          continue;
+        }
+
+        rte_mbuf* mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
+        if (unlikely(mbuf == nullptr)) {
+          RTE_LOG(ERR, CORE, "[TX Core %u] Failed to allocate mbuf\n", lcore_id);
+          delete packet;
+          continue;
+        }
+
+        // 复制数据到 mbuf
+        void* data = rte_pktmbuf_append(mbuf, packet->size());
+        rte_memcpy(data, packet->data(), packet->size());
+
+        tx_pkts[mig_sent++] = mbuf;
+        delete packet;  // 释放原始 Packet
+      }
+
+      if (likely(mig_sent > 0)) {
+        uint16_t nb_sent = rte_eth_tx_burst(port, queue_id, tx_pkts, mig_sent);
+        if (unlikely(nb_sent < mig_sent)) {
+          for (auto i : range(nb_sent, mig_sent)) {
+            rte_pktmbuf_free(tx_pkts[i]);
+          }
+        }
+      }
+    }
+
+    // 2. 处理正常 TX ring
     uint16_t nb_pkts = rte_ring_sc_dequeue_burst(
         tx_ring, reinterpret_cast<void**>(tx_pkts), BURST_SIZE, nullptr);
 
-    if (unlikely(nb_pkts == 0)) {
-      rte_pause();
-      continue;
-    } else {
+    if (likely(nb_pkts > 0)) {
       uint16_t nb_sent = rte_eth_tx_burst(port, queue_id, tx_pkts, nb_pkts);
 
       if (unlikely(nb_sent < nb_pkts)) {
@@ -376,9 +416,13 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
       }
     }
 
-    RTE_LOG(NOTICE, CORE, "[TX Core %u] exiting\n", lcore_id);
-    return;
+    // 3. 如果两个 ring 都没有数据，短暂等待
+    if (unlikely(nb_mig == 0 && nb_pkts == 0)) {
+      rte_pause();
+    }
   }
+
+  RTE_LOG(NOTICE, CORE, "[TX Core %u] exiting\n", lcore_id);
 }
 
 void DPDKHandler::DBWorker(CoreInfo core_info) {
