@@ -666,7 +666,6 @@ inline void DPDKHandler::InitAndLaunchCores() {
     } else if (core_counter < RX_CORE_NUM + WORKER_CORE_NUM) {
       uint q_idx = core_counter - RX_CORE_NUM;
       uint tx_idx = (TX_CORE_NUM > 0) ? (q_idx % TX_CORE_NUM) : 0;
-      if (q_idx >= RX_CORE_NUM) break;
 
       std::pair<rte_ring*, rte_ring*> pair = {rx_rings_[q_idx],
                                               tx_rings_[tx_idx]};
