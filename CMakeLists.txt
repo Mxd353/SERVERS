@@ -30,11 +30,10 @@ option(ENABLE_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
 option(USE_CUSTOM_GCC "Use custom GCC from HOME_DIR/gcc" OFF)
 
 # 依赖库路径配置 (可通过 -D 参数覆盖)
-# 默认使用 /home/cc/lib/boost 中的 Boost 1.90.0
-set(BOOST_ROOT "/home/cc/lib/boost" CACHE PATH "Boost installation prefix")
+set(BOOST_ROOT "$ENV{HOME}/lib/boost" CACHE PATH "Boost installation prefix")
 set(OPENSSL_ROOT "" CACHE PATH "OpenSSL installation prefix (optional)")
 set(TBB_ROOT "${CMAKE_PREFIX_PATH}/tbb" CACHE PATH "TBB installation prefix")
-set(DPDK_ROOT "${CMAKE_PREFIX_PATH}/dpdk" CACHE PATH "DPDK installation prefix")
+set(DPDK_ROOT "$ENV{HOME}/lib/dpdk" CACHE PATH "DPDK installation prefix")
 set(GCC_CUSTOM_ROOT "$ENV{HOME}/gcc" CACHE PATH "Custom GCC installation prefix")
 
 # =============================================================================

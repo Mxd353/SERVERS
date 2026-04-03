@@ -198,7 +198,7 @@ int DPDKHandler::PortInit() {
       rx_count++;
     }
     if (rx_count != nb_rx_cores) {
-      RTE_LOG(ERR, USER1, "Mismatch: Expected %u RX cores, found %u\n",
+      RTE_LOG(ERR, EAL, "Mismatch: Expected %u RX cores, found %u\n",
               nb_rx_cores, rx_count);
       return -1;
     }
@@ -218,7 +218,7 @@ int DPDKHandler::PortInit() {
   }
 
   if (tx_count != nb_tx_cores) {
-    RTE_LOG(ERR, USER1, "Mismatch: Expected %u TX cores, found %u\n",
+    RTE_LOG(ERR, EAL, "Mismatch: Expected %u TX cores, found %u\n",
             nb_tx_cores, tx_count);
     return -1;
   }
