@@ -197,11 +197,12 @@ int DPDKHandler::PortInit() {
       core.queue_id = rx_count;
       rx_count++;
     }
-    if (rx_count != nb_rx_cores) {
-      RTE_LOG(ERR, EAL, "Mismatch: Expected %u RX cores, found %u\n",
-              nb_rx_cores, rx_count);
-      return -1;
-    }
+  }
+
+  if (rx_count != nb_rx_cores) {
+    RTE_LOG(ERR, EAL, "Mismatch: Expected %u RX cores, found %u\n", nb_rx_cores,
+            rx_count);
+    return -1;
   }
 
   uint16_t tx_count = 0;
@@ -218,8 +219,8 @@ int DPDKHandler::PortInit() {
   }
 
   if (tx_count != nb_tx_cores) {
-    RTE_LOG(ERR, EAL, "Mismatch: Expected %u TX cores, found %u\n",
-            nb_tx_cores, tx_count);
+    RTE_LOG(ERR, EAL, "Mismatch: Expected %u TX cores, found %u\n", nb_tx_cores,
+            tx_count);
     return -1;
   }
 
@@ -364,22 +365,25 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
   while (true) {
     // 1. 处理缓存迁移 ring
     uint16_t nb_mig = rte_ring_mc_dequeue_burst(
-        kv_migration_ring, reinterpret_cast<void**>(mig_packets), BURST_SIZE, nullptr);
+        kv_migration_ring, reinterpret_cast<void**>(mig_packets), BURST_SIZE,
+        nullptr);
 
     if (likely(nb_mig > 0)) {
       uint16_t mig_sent = 0;
       for (auto i : range(nb_mig)) {
         Packet* packet = mig_packets[i];
         if (unlikely(packet->size() > TX_MBUF_DATA_SIZE)) {
-          RTE_LOG(WARNING, CORE, "[TX Core %u] Migration packet too large: %zu\n",
-                  lcore_id, packet->size());
+          RTE_LOG(WARNING, CORE,
+                  "[TX Core %u] Migration packet too large: %zu\n", lcore_id,
+                  packet->size());
           delete packet;
           continue;
         }
 
         rte_mbuf* mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
         if (unlikely(mbuf == nullptr)) {
-          RTE_LOG(ERR, CORE, "[TX Core %u] Failed to allocate mbuf\n", lcore_id);
+          RTE_LOG(ERR, CORE, "[TX Core %u] Failed to allocate mbuf\n",
+                  lcore_id);
           delete packet;
           continue;
         }
@@ -456,7 +460,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
     std::string db_socket = std::to_string(i + start_db);
     cfg.unix_socket = "/tmp/redis." + db_socket;
-    redis::logger l;
+    redis::logger l(redis::logger::level::err);
     auto conn = std::make_shared<redis::connection>(ioc.get_executor(), l);
     conn->async_run(cfg, net::consign(net::detached, conn));
     conns.push_back(conn);
@@ -490,6 +494,91 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     p.read_mbufs.reserve(BURST_SIZE);
     p.write_mbufs.reserve(BURST_SIZE);
   }
+
+  // Lambda to flush write pipeline
+  auto flush_write_pipeline = [&](uint32_t db_idx, DBPipeline& pipeline) {
+    if (pipeline.write_req.get_commands() == 0) return;
+
+    auto conn = conns[db_idx];
+
+    auto req_copy = std::move(pipeline.write_req);
+    auto mbufs_copy = std::move(pipeline.write_mbufs);
+
+    pipeline.write_req = redis::request{};
+    pipeline.write_mbufs.clear();
+    pipeline.last_write_flush = std::chrono::steady_clock::now();
+
+    conn->async_exec(
+        req_copy, redis::ignore,
+        [mbufs = std::move(mbufs_copy), tx_ring, lcore_id](auto ec, auto) {
+          if (ec) {
+            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
+                    lcore_id, ec.message().c_str());
+            for (auto* m : mbufs) rte_pktmbuf_free(m);
+            return;
+          }
+
+          uint16_t ret = rte_ring_mp_enqueue_bulk(
+              tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
+              mbufs.size(), nullptr);
+          if (ret < mbufs.size()) {
+            for (auto i : range(ret, mbufs.size())) {
+              rte_pktmbuf_free(mbufs[i]);
+            }
+          }
+        });
+  };
+
+  // Lambda to flush read pipeline
+  auto flush_read_pipeline = [&](uint32_t db_idx, DBPipeline& pipeline) {
+    if (pipeline.read_mbufs.empty()) return;
+
+    auto conn = conns[db_idx];
+
+    auto req_copy = std::move(pipeline.read_req);
+    auto mbufs_copy = std::move(pipeline.read_mbufs);
+
+    pipeline.read_req = redis::request{};
+    pipeline.read_mbufs.clear();
+    pipeline.last_read_flush = std::chrono::steady_clock::now();
+
+    auto resp =
+        std::make_shared<redis::response<std::vector<std::string>>>();
+
+    conn->async_exec(
+        std::move(req_copy), *resp,
+        [resp, tx_ring, mbufs = std::move(mbufs_copy), lcore_id](
+            auto ec, auto) mutable {
+          if (ec) {
+            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
+                    lcore_id, ec.message().c_str());
+            for (auto* m : mbufs) rte_pktmbuf_free(m);
+            return;
+          }
+
+          auto& vec = std::get<0>(*resp).value();
+
+          for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
+            auto* kv_h = rte_pktmbuf_mtod_offset(mbufs[i], KVRequest*,
+                                                 KV_HEADER_OFFSET);
+
+            const std::string& val = vec[i];
+            if (!val.empty()) {
+              rte_memcpy(kv_h->value1.data(), val.data(),
+                         std::min(val.size(),
+                                  static_cast<size_t>(VALUE_LENGTH * 4)));
+            }
+          }
+
+          uint16_t ret = rte_ring_mp_enqueue_bulk(
+              tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
+              mbufs.size(), nullptr);
+          if (ret < mbufs.size()) {
+            for (auto i : range(ret, mbufs.size()))
+              rte_pktmbuf_free(mbufs[i]);
+          }
+        });
+  };
 
   while (true) {
     struct ipc_req* reqs[BURST_SIZE];
@@ -529,6 +618,9 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
               server_instance->CacheMigrate(key, kv_migrate->migration_id);
             }
             rte_pktmbuf_free(req->mbuf);
+
+            // Flush any pending write requests before continuing
+            flush_write_pipeline(db_idx, pipeline);
             continue;
           }
 
@@ -543,85 +635,13 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         if (pipeline.write_req.get_commands() >= BURST_SIZE ||
             (std::chrono::steady_clock::now() - pipeline.last_write_flush) >
                 std::chrono::milliseconds(1)) {
-          auto conn = conns[db_idx];
-
-          auto req_copy = std::move(pipeline.write_req);
-          auto mbufs_copy = std::move(pipeline.write_mbufs);
-
-          pipeline.write_req = redis::request{};
-          pipeline.write_mbufs.clear();
-          pipeline.last_write_flush = std::chrono::steady_clock::now();
-
-          conn->async_exec(
-              req_copy, redis::ignore,
-              [mbufs = std::move(mbufs_copy), tx_ring, lcore_id](auto ec,
-                                                                 auto) {
-                if (ec) {
-                  RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
-                          lcore_id, ec.message().c_str());
-                  for (auto* m : mbufs) rte_pktmbuf_free(m);
-                  return;
-                }
-
-                uint16_t ret = rte_ring_mp_enqueue_bulk(
-                    tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
-                    mbufs.size(), nullptr);
-                if (ret < mbufs.size()) {
-                  for (auto i : range(ret, mbufs.size())) {
-                    rte_pktmbuf_free(mbufs[i]);
-                  }
-                }
-              });
+          flush_write_pipeline(db_idx, pipeline);
         }
 
         if (pipeline.read_mbufs.size() >= BURST_SIZE ||
             (std::chrono::steady_clock::now() - pipeline.last_read_flush) >
                 std::chrono::milliseconds(1)) {
-          auto conn = conns[db_idx];
-
-          auto req_copy = std::move(pipeline.read_req);
-          auto mbufs_copy = std::move(pipeline.read_mbufs);
-
-          pipeline.read_req = redis::request{};
-          pipeline.read_mbufs.clear();
-          pipeline.last_read_flush = std::chrono::steady_clock::now();
-
-          auto resp =
-              std::make_shared<redis::response<std::vector<std::string>>>();
-
-          conn->async_exec(
-              std::move(req_copy), *resp,
-              [resp, tx_ring, mbufs = std::move(mbufs_copy), lcore_id](
-                  auto ec, auto) mutable {
-                if (ec) {
-                  RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
-                          lcore_id, ec.message().c_str());
-                  for (auto* m : mbufs) rte_pktmbuf_free(m);
-                  return;
-                }
-
-                auto& vec = std::get<0>(*resp).value();
-
-                for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
-                  auto* kv_h = rte_pktmbuf_mtod_offset(mbufs[i], KVRequest*,
-                                                       KV_HEADER_OFFSET);
-
-                  const std::string& val = vec[i];
-                  if (!val.empty()) {
-                    rte_memcpy(kv_h->value1.data(), val.data(),
-                               std::min(val.size(),
-                                        static_cast<size_t>(VALUE_LENGTH * 4)));
-                  }
-                }
-
-                uint16_t ret = rte_ring_mp_enqueue_bulk(
-                    tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
-                    mbufs.size(), nullptr);
-                if (ret < mbufs.size()) {
-                  for (auto i : range(ret, mbufs.size()))
-                    rte_pktmbuf_free(mbufs[i]);
-                }
-              });
+          flush_read_pipeline(db_idx, pipeline);
         }
       }
     } else {
@@ -660,6 +680,8 @@ inline void DPDKHandler::InitAndLaunchCores() {
   uint core_counter = 0;
   uint lcore_id;
 
+  printf("lcore_count = %u\n", rte_lcore_count());
+
   RTE_LCORE_FOREACH_WORKER(lcore_id) {
     if (core_counter < RX_CORE_NUM) {
       all_cores_.emplace_back(lcore_id, CoreType::RX_CORE, &rx_rings_);
@@ -681,6 +703,7 @@ inline void DPDKHandler::InitAndLaunchCores() {
     core_counter++;
     if (core_counter >= TOTAL_CORE_NUM) break;
   }
+  printf("worker_count = %u\n", core_counter);
 }
 
 inline void DPDKHandler::CreatPool() {
