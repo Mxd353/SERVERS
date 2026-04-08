@@ -489,8 +489,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     std::chrono::steady_clock::time_point last_write_flush;
   };
 
-  const uint32_t GLOBAL_BURST_SIZE = 128;
-  const uint32_t MAX_INFLIGHT_WINDOW = 4096;
+  const uint32_t MAX_INFLIGHT_WINDOW = 128;
 
   std::vector<std::atomic<uint32_t>> db_inflight(db_count);
   for (auto& x : db_inflight) x.store(0);
