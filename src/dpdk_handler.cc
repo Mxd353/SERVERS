@@ -10,8 +10,10 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <chrono>
 #include <fstream>
 #include <iostream>
+#include <memory>
 
 #include "lib/utils.h"
 
@@ -455,11 +457,10 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
   for (auto i : range(db_count)) {
     redis::config cfg;
-    // cfg.addr.host = "127.0.0.1";
-    // cfg.addr.port = std::to_string(i + start_db + DB_BASE_PORT);
-
     std::string db_socket = std::to_string(i + start_db);
+
     cfg.unix_socket = "/tmp/redis." + db_socket;
+
     redis::logger l(redis::logger::level::err);
     auto conn = std::make_shared<redis::connection>(ioc.get_executor(), l);
     conn->async_run(cfg, net::consign(net::detached, conn));
@@ -488,19 +489,39 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     std::chrono::steady_clock::time_point last_write_flush;
   };
 
-  std::vector<DBPipeline> pipelines(db_count);
+  const uint32_t GLOBAL_BURST_SIZE = 128;
+  const uint32_t MAX_INFLIGHT_WINDOW = 4096;
 
-  for (auto& p : pipelines) {
-    p.read_mbufs.reserve(BURST_SIZE);
-    p.write_mbufs.reserve(BURST_SIZE);
+  std::vector<std::atomic<uint32_t>> db_inflight(db_count);
+  for (auto& x : db_inflight) x.store(0);
+
+  // 记录当前有数据积压的 DB 索引
+  std::vector<uint32_t> active_dbs;
+  active_dbs.reserve(db_count);
+  std::vector<bool> is_db_active(db_count, false);
+
+  std::vector<DBPipeline> pipelines(db_count);
+  auto base_time = std::chrono::steady_clock::now();
+
+  // 为每个 DB 创建 TokenBucket 限速器
+  std::vector<std::unique_ptr<TokenBucket>> rate_limiters;
+  rate_limiters.reserve(db_count);
+  for ([[maybe_unused]] auto i : range(db_count)) {
+    rate_limiters.emplace_back(std::make_unique<TokenBucket>());
+    pipelines[i].read_mbufs.reserve(BURST_SIZE);
+    pipelines[i].write_mbufs.reserve(BURST_SIZE);
+    pipelines[i].last_write_flush =
+        base_time + std::chrono::microseconds(i * 10);
+    pipelines[i].last_read_flush =
+        base_time + std::chrono::microseconds(i * 10);
   }
 
   // Lambda to flush write pipeline
   auto flush_write_pipeline = [&](uint32_t db_idx, DBPipeline& pipeline) {
-    if (pipeline.write_req.get_commands() == 0) return;
+    uint32_t batch_size = pipeline.write_req.get_commands();
+    if (batch_size == 0) return;
 
     auto conn = conns[db_idx];
-
     auto req_copy = std::move(pipeline.write_req);
     auto mbufs_copy = std::move(pipeline.write_mbufs);
 
@@ -508,33 +529,39 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     pipeline.write_mbufs.clear();
     pipeline.last_write_flush = std::chrono::steady_clock::now();
 
-    conn->async_exec(
-        req_copy, redis::ignore,
-        [mbufs = std::move(mbufs_copy), tx_ring, lcore_id](auto ec, auto) {
-          if (ec) {
-            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
-                    lcore_id, ec.message().c_str());
-            for (auto* m : mbufs) rte_pktmbuf_free(m);
-            return;
-          }
+    db_inflight[db_idx].fetch_add(batch_size, std::memory_order_relaxed);
 
-          uint16_t ret = rte_ring_mp_enqueue_bulk(
-              tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
-              mbufs.size(), nullptr);
-          if (ret < mbufs.size()) {
-            for (auto i : range(ret, mbufs.size())) {
-              rte_pktmbuf_free(mbufs[i]);
-            }
-          }
-        });
+    conn->async_exec(req_copy, redis::ignore,
+                     [mbufs = std::move(mbufs_copy), tx_ring, lcore_id,
+                      &db_inflight, db_idx](auto ec, auto) {
+                       db_inflight[db_idx].fetch_sub(mbufs.size(),
+                                                     std::memory_order_relaxed);
+
+                       if (ec) {
+                         RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
+                                 lcore_id, ec.message().c_str());
+                         for (auto* m : mbufs) rte_pktmbuf_free(m);
+                         return;
+                       }
+
+                       uint16_t ret = rte_ring_mp_enqueue_bulk(
+                           tx_ring,
+                           reinterpret_cast<void* const*>(mbufs.data()),
+                           mbufs.size(), nullptr);
+                       if (ret < mbufs.size()) {
+                         for (auto i : range(ret, mbufs.size())) {
+                           rte_pktmbuf_free(mbufs[i]);
+                         }
+                       }
+                     });
   };
 
   // Lambda to flush read pipeline
   auto flush_read_pipeline = [&](uint32_t db_idx, DBPipeline& pipeline) {
-    if (pipeline.read_mbufs.empty()) return;
+    uint32_t batch_size = pipeline.read_mbufs.size();
+    if (batch_size == 0) return;
 
     auto conn = conns[db_idx];
-
     auto req_copy = std::move(pipeline.read_req);
     auto mbufs_copy = std::move(pipeline.read_mbufs);
 
@@ -542,16 +569,20 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     pipeline.read_mbufs.clear();
     pipeline.last_read_flush = std::chrono::steady_clock::now();
 
-    auto resp =
-        std::make_shared<redis::response<std::vector<std::string>>>();
+    db_inflight[db_idx].fetch_add(batch_size, std::memory_order_relaxed);
+
+    auto resp = std::make_shared<redis::response<std::vector<std::string>>>();
 
     conn->async_exec(
         std::move(req_copy), *resp,
-        [resp, tx_ring, mbufs = std::move(mbufs_copy), lcore_id](
-            auto ec, auto) mutable {
+        [resp, tx_ring, mbufs = std::move(mbufs_copy), lcore_id, &db_inflight,
+         db_idx](auto ec, auto) mutable {
+          db_inflight[db_idx].fetch_sub(mbufs.size(),
+                                        std::memory_order_relaxed);
+
           if (ec) {
-            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
-                    lcore_id, ec.message().c_str());
+            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n", lcore_id,
+                    ec.message().c_str());
             for (auto* m : mbufs) rte_pktmbuf_free(m);
             return;
           }
@@ -559,14 +590,14 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           auto& vec = std::get<0>(*resp).value();
 
           for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
-            auto* kv_h = rte_pktmbuf_mtod_offset(mbufs[i], KVRequest*,
-                                                 KV_HEADER_OFFSET);
+            auto* kv_h =
+                rte_pktmbuf_mtod_offset(mbufs[i], KVRequest*, KV_HEADER_OFFSET);
 
             const std::string& val = vec[i];
             if (!val.empty()) {
-              rte_memcpy(kv_h->value1.data(), val.data(),
-                         std::min(val.size(),
-                                  static_cast<size_t>(VALUE_LENGTH * 4)));
+              rte_memcpy(
+                  kv_h->value1.data(), val.data(),
+                  std::min(val.size(), static_cast<size_t>(VALUE_LENGTH * 4)));
             }
           }
 
@@ -574,8 +605,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
               tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
               mbufs.size(), nullptr);
           if (ret < mbufs.size()) {
-            for (auto i : range(ret, mbufs.size()))
-              rte_pktmbuf_free(mbufs[i]);
+            for (auto i : range(ret, mbufs.size())) rte_pktmbuf_free(mbufs[i]);
           }
         });
   };
@@ -584,6 +614,8 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     struct ipc_req* reqs[BURST_SIZE];
     const uint16_t nb_rx =
         rte_ring_sc_dequeue_bulk(rx_ring, (void**)reqs, BURST_SIZE, nullptr);
+
+    auto current_time = std::chrono::steady_clock::now();
 
     if (nb_rx > 0) {
       for (auto i : range(nb_rx)) {
@@ -597,13 +629,30 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           continue;
         }
 
+        if (unlikely(db_inflight[db_idx].load(std::memory_order_relaxed) >=
+                     MAX_INFLIGHT_WINDOW)) {
+          // 该 DB 已过载，执行丢包，保护 Worker 和其他 DB
+          rte_pktmbuf_free(req->mbuf);
+          rte_mempool_put(ipc_mempool_, req);
+          continue;
+        }
+
+        // 限速检查：超过 1000 QPS 直接丢弃请求
+        if (!rate_limiters[db_idx]->TryConsume()) {
+          rte_pktmbuf_free(req->mbuf);
+          rte_mempool_put(ipc_mempool_, req);
+          continue;
+        }
+
         auto& pipeline = pipelines[db_idx];
+        if (!is_db_active[db_idx]) {
+          is_db_active[db_idx] = true;
+          active_dbs.push_back(db_idx);
+        }
 
         auto* kv_hdr =
             rte_pktmbuf_mtod_offset(req->mbuf, KVRequest*, KV_HEADER_OFFSET);
-
         uint8_t is_req = GET_IS_REQ(kv_hdr->combined);
-
         std::string_view key(kv_hdr->key.data(), KEY_LENGTH);
 
         if (GET_OP(kv_hdr->combined) == WRITE_REQUEST) {
@@ -619,32 +668,91 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
             }
             rte_pktmbuf_free(req->mbuf);
 
-            // Flush any pending write requests before continuing
             flush_write_pipeline(db_idx, pipeline);
             continue;
           }
 
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
           pipeline.write_mbufs.push_back(req->mbuf);
+
+          if (pipeline.write_req.get_commands() >= BURST_SIZE) {
+            flush_write_pipeline(db_idx, pipeline);
+          }
         } else {
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
           pipeline.read_req.push("GET", key);
           pipeline.read_mbufs.push_back(req->mbuf);
-        }
 
-        if (pipeline.write_req.get_commands() >= BURST_SIZE ||
-            (std::chrono::steady_clock::now() - pipeline.last_write_flush) >
-                std::chrono::milliseconds(1)) {
-          flush_write_pipeline(db_idx, pipeline);
-        }
-
-        if (pipeline.read_mbufs.size() >= BURST_SIZE ||
-            (std::chrono::steady_clock::now() - pipeline.last_read_flush) >
-                std::chrono::milliseconds(1)) {
-          flush_read_pipeline(db_idx, pipeline);
+          if (pipeline.read_mbufs.size() >= BURST_SIZE) {
+            flush_read_pipeline(db_idx, pipeline);
+          }
         }
       }
+    }  // end of for (auto i : range(nb_rx))
+
+    static auto last_sched = std::chrono::steady_clock::now();
+
+    static auto sched_interval = std::chrono::microseconds(50);
+    static uint32_t consecutive_busy = 0;
+
+    if (nb_rx > BURST_SIZE * 0.8) {
+      consecutive_busy++;
+      if (consecutive_busy > 10) {
+        sched_interval =
+            std::max(sched_interval / 2, std::chrono::microseconds(10));
+        consecutive_busy = 0;
+      }
     } else {
+      sched_interval =
+          std::min(sched_interval * 2, std::chrono::microseconds(500));
+    }
+
+    if (unlikely((current_time - last_sched) >= sched_interval)) {
+      last_sched = current_time;
+
+      std::vector<uint32_t> next_active_dbs;
+      next_active_dbs.reserve(active_dbs.size());
+
+      for (uint32_t db_idx : active_dbs) {
+        auto& pipeline = pipelines[db_idx];
+
+        if (db_inflight[db_idx].load(std::memory_order_relaxed) >=
+            MAX_INFLIGHT_WINDOW) {
+          next_active_dbs.push_back(db_idx);
+          continue;
+        }
+
+        bool still_active = false;
+
+        if (pipeline.write_req.get_commands() > 0) {
+          if ((current_time - pipeline.last_write_flush) >=
+              std::chrono::milliseconds(1)) {
+            flush_write_pipeline(db_idx, pipeline);
+          } else {
+            still_active = true;
+          }
+        }
+
+        if (!pipeline.read_mbufs.empty()) {
+          if ((current_time - pipeline.last_read_flush) >=
+              std::chrono::milliseconds(1)) {
+            flush_read_pipeline(db_idx, pipeline);
+          } else {
+            still_active = true;
+          }
+        }
+
+        if (still_active) {
+          next_active_dbs.push_back(db_idx);
+        } else {
+          is_db_active[db_idx] = false;
+        }
+      }
+
+      active_dbs = std::move(next_active_dbs);
+    }
+
+    if (nb_rx == 0) {
       rte_pause();
     }
   }
