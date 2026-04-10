@@ -32,7 +32,7 @@
 
 constexpr uint32_t RX_CORE_NUM = 8;
 constexpr uint32_t WORKER_CORE_NUM = RX_CORE_NUM;
-constexpr uint32_t TX_CORE_NUM = 4;
+constexpr uint32_t TX_CORE_NUM = 2;
 constexpr uint32_t TOTAL_CORE_NUM = RX_CORE_NUM + WORKER_CORE_NUM + TX_CORE_NUM;
 constexpr uint32_t NUM_RACKS = 32;
 constexpr uint32_t RING_SIZE = 262144;
