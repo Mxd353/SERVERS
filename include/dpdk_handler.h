@@ -93,10 +93,15 @@ class DPDKHandler {
           servers);
   void Start();
   void Stop();
+  void RequestStop() { stop_requested_.store(true, std::memory_order_relaxed); }
+  [[nodiscard]] auto IsStopRequested() const -> bool {
+    return stop_requested_.load(std::memory_order_relaxed);
+  }
   rte_ring* kv_migration_ring;
 
  private:
   volatile bool initialized_ = false;
+  std::atomic<bool> stop_requested_{false};
   rte_mempool* tx_mbufpool_;
   rte_mempool* rx_mbufpool_;
   rte_mempool* ipc_mempool_;

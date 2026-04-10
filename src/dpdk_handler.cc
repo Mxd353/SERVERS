@@ -289,9 +289,9 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
     RTE_LOG(NOTICE, CORE, "[Rx Core %u] polling queue: %hu\n", lcore_id,
             queue_id);
 
-    rte_mbuf* rx_pkts[BURST_SIZE];
-    while (true) {
-      uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, rx_pkts, BURST_SIZE);
+  rte_mbuf* rx_pkts[BURST_SIZE];
+  while (!stop_requested_.load(std::memory_order_relaxed)) {
+    uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, rx_pkts, BURST_SIZE);
       if (unlikely(nb_rx == 0)) {
         rte_pause();
         continue;
@@ -363,7 +363,7 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
   rte_mbuf* tx_pkts[BURST_SIZE];
   Packet* mig_packets[BURST_SIZE];
 
-  while (true) {
+  while (!stop_requested_.load(std::memory_order_relaxed)) {
     // 1. 处理缓存迁移 ring
     uint16_t nb_mig = rte_ring_mc_dequeue_burst(
         kv_migration_ring, reinterpret_cast<void**>(mig_packets), BURST_SIZE,
@@ -606,7 +606,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         });
   };
 
-  while (true) {
+  while (!stop_requested_.load(std::memory_order_relaxed)) {
     struct ipc_req* reqs[BURST_SIZE];
     const uint16_t nb_rx =
         rte_ring_sc_dequeue_bulk(rx_ring, (void**)reqs, BURST_SIZE, nullptr);
@@ -926,7 +926,7 @@ void DPDKHandler::Start() {
   // start threads
   LaunchThreads();
 
-  while (true) {
+  while (!stop_requested_.load(std::memory_order_relaxed)) {
     monitor_mempool(rx_mbufpool_);
     monitor_mempool(tx_mbufpool_);
 
@@ -941,9 +941,14 @@ void DPDKHandler::Start() {
 }
 
 void DPDKHandler::Stop() {
-  if (initialized_) {
-    std::cout << "[DPDK] Cleanup triggered\n";
-    initialized_ = false;
+  if (initialized_ && !stop_requested_.load(std::memory_order_relaxed)) {
+    std::cout << "[DPDK] Stopping...\n";
+    stop_requested_.store(true, std::memory_order_relaxed);
+
+    // Wait for all lcores to finish
+    rte_eal_mp_wait_lcore();
+
+    std::cout << "[DPDK] All lcores stopped\n";
 
     uint16_t port = 0;
     rte_eth_dev_stop(port);
@@ -952,6 +957,6 @@ void DPDKHandler::Stop() {
     rte_ring_free(kv_migration_ring);
 
     rte_eal_cleanup();
-    std::cout << "Bye..." << std::endl;
+    std::cout << "[DPDK] Cleanup completed\n";
   }
 }

@@ -11,6 +11,7 @@
 
 std::atomic<bool> exit_requested(false);
 std::unique_ptr<ServerCluster> clusters;
+std::shared_ptr<DPDKHandler> dpdk_handler;
 
 extern std::atomic<uint64_t> total_latency_us;
 extern std::atomic<size_t> completed_request_count;
@@ -22,9 +23,15 @@ void signalHandler(int signal) {
   uint64_t total_latency = total_latency_us.load(std::memory_order_relaxed);
 
   exit_requested.store(true);
+
   if (clusters) {
     clusters->Stop();
-    std::cout << "All clusters stop" << std::endl;
+    std::cout << "All clusters stopped" << std::endl;
+  }
+
+  if (dpdk_handler) {
+    dpdk_handler->Stop();
+    std::cout << "DPDK handler stopped" << std::endl;
   }
 
   double latency_us_per_request =
@@ -36,7 +43,7 @@ void signalHandler(int signal) {
             << latency_us_per_request / 1'000.0 << "( "
             << latency_us_per_request << " us/op)" << std::endl;
 
-  std::exit(0);
+  // Let main return normally to trigger destructors
 }
 
 void parseClusterInfo(const std::string& server_conf,
@@ -112,24 +119,27 @@ auto main(int argc, char* argv[]) -> int {
   char* progrom_name = argv[0];
   std::string dpdk_conf = "conf/dpdk.conf";
 
-  auto dpdk_hander = std::make_shared<DPDKHandler>();
+  dpdk_handler = std::make_shared<DPDKHandler>();
 
   std::cout << "RUN: Starting server cluster >>" << std::endl;
   clusters = std::make_unique<ServerCluster>(racks, controller_info);
   auto servers = clusters->GetIpToServerMap();
 
-  bool success = dpdk_hander->Initialize(dpdk_conf, progrom_name, servers);
+  bool success = dpdk_handler->Initialize(dpdk_conf, progrom_name, servers);
   if (!success) {
-    std::cout << "dpdk_hander initialize faile >>" << std::endl;
+    std::cout << "dpdk_handler initialize failed >>" << std::endl;
     return 0;
   }
 
   clusters->Start(1);
-  dpdk_hander->Start();
+  dpdk_handler->Start();
 
   while (!exit_requested.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
+
+  // DPDK handler and clusters will be stopped by signalHandler
+  // or will be cleaned up by destructors when main returns
 
   return 0;
 }
