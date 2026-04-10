@@ -33,8 +33,8 @@ namespace redis = boost::redis;
 
 using namespace utils;
 
-std::atomic<uint64_t> total_latency_us{0};
-std::atomic<size_t> completed_request_count{0};
+[[maybe_unused]] std::atomic<uint64_t> total_latency_us{0};
+[[maybe_unused]] std::atomic<size_t> completed_request_count{0};
 std::atomic<uint32_t> next_db_id{0};
 
 std::ofstream outfile("server.output");
@@ -303,15 +303,14 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           auto* mbuf = rx_pkts[i];
 
           rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(mbuf, rte_ether_hdr*);
-
           rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
 
           if (unlikely(ip_hdr->next_proto_id != IPPROTO_UDP)) {
             rte_pktmbuf_free(rx_pkts[i]);
             continue;
           }
-          rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
 
+          rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
           uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
 
           if (unlikely(dst_port != UDP_PORT_KV)) {
@@ -505,14 +504,14 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   // 为每个 DB 创建 TokenBucket 限速器
   std::vector<std::unique_ptr<TokenBucket>> rate_limiters;
   rate_limiters.reserve(db_count);
-  for ([[maybe_unused]] auto i : range(db_count)) {
+  for (auto i : range(db_count)) {
     rate_limiters.emplace_back(std::make_unique<TokenBucket>());
-    pipelines[i].read_mbufs.reserve(BURST_SIZE);
-    pipelines[i].write_mbufs.reserve(BURST_SIZE);
-    pipelines[i].last_write_flush =
-        base_time + std::chrono::microseconds(i * 10);
-    pipelines[i].last_read_flush =
-        base_time + std::chrono::microseconds(i * 10);
+    auto& p = pipelines[i];
+    p.read_mbufs.reserve(BURST_SIZE);
+    p.write_mbufs.reserve(BURST_SIZE);
+    auto stagger = std::chrono::microseconds(i * 10);
+    p.last_write_flush = base_time + stagger;
+    p.last_read_flush = base_time + stagger;
   }
 
   // Lambda to flush write pipeline
@@ -530,29 +529,28 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
     db_inflight[db_idx].fetch_add(batch_size, std::memory_order_relaxed);
 
-    conn->async_exec(req_copy, redis::ignore,
-                     [mbufs = std::move(mbufs_copy), tx_ring, lcore_id,
-                      &db_inflight, db_idx](auto ec, auto) {
-                       db_inflight[db_idx].fetch_sub(mbufs.size(),
-                                                     std::memory_order_relaxed);
+    conn->async_exec(
+        req_copy, redis::ignore,
+        [mbufs = std::move(mbufs_copy), tx_ring,
+         &inflight = db_inflight[db_idx]](auto ec, auto) {
+          inflight.fetch_sub(mbufs.size(), std::memory_order_relaxed);
 
-                       if (ec) {
-                         RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
-                                 lcore_id, ec.message().c_str());
-                         for (auto* m : mbufs) rte_pktmbuf_free(m);
-                         return;
-                       }
+          if (ec) {
+            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
+                    rte_lcore_id(), ec.message().c_str());
+            for (auto* m : mbufs) rte_pktmbuf_free(m);
+            return;
+          }
 
-                       uint16_t ret = rte_ring_mp_enqueue_bulk(
-                           tx_ring,
-                           reinterpret_cast<void* const*>(mbufs.data()),
-                           mbufs.size(), nullptr);
-                       if (ret < mbufs.size()) {
-                         for (auto i : range(ret, mbufs.size())) {
-                           rte_pktmbuf_free(mbufs[i]);
-                         }
-                       }
-                     });
+          uint16_t ret = rte_ring_mp_enqueue_bulk(
+              tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
+              mbufs.size(), nullptr);
+          if (ret < mbufs.size()) {
+            for (auto i : range(ret, mbufs.size())) {
+              rte_pktmbuf_free(mbufs[i]);
+            }
+          }
+        });
   };
 
   // Lambda to flush read pipeline
@@ -570,23 +568,22 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
     db_inflight[db_idx].fetch_add(batch_size, std::memory_order_relaxed);
 
-    auto resp = std::make_shared<redis::response<std::vector<std::string>>>();
+    auto resps = std::make_shared<redis::response<std::vector<std::string>>>();
 
     conn->async_exec(
-        std::move(req_copy), *resp,
-        [resp, tx_ring, mbufs = std::move(mbufs_copy), lcore_id, &db_inflight,
-         db_idx](auto ec, auto) mutable {
-          db_inflight[db_idx].fetch_sub(mbufs.size(),
-                                        std::memory_order_relaxed);
+        std::move(req_copy), *resps,
+        [resps, tx_ring, mbufs = std::move(mbufs_copy),
+         &inflight = db_inflight[db_idx]](auto ec, auto) mutable {
+          inflight.fetch_sub(mbufs.size(), std::memory_order_relaxed);
 
           if (ec) {
-            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n", lcore_id,
-                    ec.message().c_str());
+            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
+                    rte_lcore_id(), ec.message().c_str());
             for (auto* m : mbufs) rte_pktmbuf_free(m);
             return;
           }
 
-          auto& vec = std::get<0>(*resp).value();
+          auto& vec = std::get<0>(*resps).value();
 
           for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
             auto* kv_h =
