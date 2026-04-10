@@ -289,9 +289,9 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
     RTE_LOG(NOTICE, CORE, "[Rx Core %u] polling queue: %hu\n", lcore_id,
             queue_id);
 
-  rte_mbuf* rx_pkts[BURST_SIZE];
-  while (!stop_requested_.load(std::memory_order_relaxed)) {
-    uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, rx_pkts, BURST_SIZE);
+    rte_mbuf* rx_pkts[BURST_SIZE];
+    while (!stop_requested_.load(std::memory_order_relaxed)) {
+      uint16_t nb_rx = rte_eth_rx_burst(port, queue_id, rx_pkts, BURST_SIZE);
       if (unlikely(nb_rx == 0)) {
         rte_pause();
         continue;
