@@ -6,3 +6,4 @@ redis/confs/*
 redis/pids/*
 .cache/
 redis/data/*
+test_boost_redis/*

@@ -458,8 +458,9 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
     cfg.unix_socket = "/tmp/redis." + db_socket;
 
-    redis::logger l(redis::logger::level::err);
-    auto conn = std::make_shared<redis::connection>(ioc.get_executor(), l);
+    auto conn =
+        std::make_shared<redis::connection>(ioc, redis::logger::level::err);
+
     conn->async_run(cfg, net::consign(net::detached, conn));
     conns.push_back(conn);
   }
@@ -542,7 +543,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           }
 
           RTE_LOG(ERR, DB, "[core %u] Redis WRITE success\n", lcore_id);
-          
+
           uint16_t ret = rte_ring_mp_enqueue_bulk(
               tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
               mbufs.size(), nullptr);
