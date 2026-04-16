@@ -484,15 +484,16 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
     if (nb_rx > 0) {
       for (auto i : range(nb_rx)) {
-        auto& req = reqs[i];
-        auto* mbuf = req->mbuf;
+        auto* mbuf = reqs[i]->mbuf;
+        const uint32_t db_id = reqs[i]->db_id;
+        const auto src_ip = reqs[i]->src_ip;
+        rte_mempool_put(ipc_mempool_, reqs[i]);
 
-        const uint32_t db_idx = req->db_id - start_db;
+        const uint32_t db_idx = db_id - start_db;
         if (unlikely(db_idx >= db_count)) {
           RTE_LOG(WARNING, DB, "[core %u] Invalid DB ID: %u\n", lcore_id,
-                  req->db_id);
+                  db_id);
           rte_pktmbuf_free(mbuf);
-          rte_mempool_put(ipc_mempool_, req);
           continue;
         }
         auto* kv_hdr =
@@ -509,13 +510,12 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           if (is_req == CACHE_MIGRATE) {
             auto* kv_migrate =
                 rte_pktmbuf_mtod_offset(mbuf, KVMigrate*, KV_HEADER_OFFSET);
-            auto server_instance = GetServerByIp(req->src_ip);
+            auto server_instance = GetServerByIp(src_ip);
             if (server_instance) {
               server_instance->CacheMigrate(key, kv_migrate->migration_id);
             }
 
             rte_pktmbuf_free(mbuf);
-            rte_mempool_put(ipc_mempool_, req);
 
             conns[db_idx]->async_exec(
                 *db_req, redis::ignore, [db_req, lcore_id](auto ec, auto) {
@@ -528,8 +528,6 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           }
 
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
-
-          rte_mempool_put(ipc_mempool_, req);
 
           conns[db_idx]->async_exec(
               *db_req, redis::ignore,
@@ -550,8 +548,6 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         } else if (GET_OP(kv_hdr->combined) == READ_REQUEST) {
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
 
-          rte_mempool_put(ipc_mempool_, req);
-
           auto db_req = std::make_shared<redis::request>();
           db_req->push("GET", key);
           auto resp = std::make_shared<redis::response<std::string>>();
@@ -560,8 +556,8 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
               *db_req, *resp,
               [mbuf, db_req, resp, tx_ring, lcore_id](auto ec, auto) {
                 if (ec) {
-                  RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n",
-                          lcore_id, ec.message().c_str());
+                  RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n", lcore_id,
+                          ec.message().c_str());
                   rte_pktmbuf_free(mbuf);
                   return;
                 }
