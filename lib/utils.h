@@ -99,12 +99,13 @@ auto range(T1 start, T2 stop, T3 step = 1)
 }
 
 inline void monitor_mempool(rte_mempool* mp) {
+  const char* name = mp->name;
   unsigned avail = rte_mempool_avail_count(mp);
   unsigned in_use = rte_mempool_in_use_count(mp);
   double use_percent = (double)in_use * 100.0 / (double)mp->size;
 
-  RTE_LOG(NOTICE, MEMPOOL, "Status: Available=%u, In_use=%u (%.1f%%)\n", avail,
-          in_use, use_percent);
+  RTE_LOG(NOTICE, MEMPOOL, "%s: Available=%u, In_use=%u (%.1f%%)\n", name,
+          avail, in_use, use_percent);
 }
 
 inline uint64_t get_now_micros() {
@@ -197,7 +198,7 @@ static inline uint32_t generate_request_id() {
 }
 
 static inline std::vector<uint> SampleIndices(uint base, uint limit,
-                                               size_t sample_size) {
+                                              size_t sample_size) {
   std::vector<uint> indices(limit - base);
   indices.reserve(sample_size);
   std::iota(indices.begin(), indices.end(), base);
@@ -228,8 +229,7 @@ static inline uint16_t IpChecksum(uint16_t* buffer, int size) {
 }
 
 // Helper to construct sockaddr_ll for raw packet sending
-static inline sockaddr_ll MakeSockAddrLl(int ifindex,
-                                          const uint8_t* dst_mac) {
+static inline sockaddr_ll MakeSockAddrLl(int ifindex, const uint8_t* dst_mac) {
   sockaddr_ll addr = {};
   addr.sll_family = AF_PACKET;
   addr.sll_ifindex = ifindex;

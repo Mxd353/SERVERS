@@ -37,7 +37,7 @@ using namespace utils;
 [[maybe_unused]] std::atomic<size_t> completed_request_count{0};
 std::atomic<uint32_t> next_db_id{0};
 
-std::ofstream outfile("server.output");
+// std::ofstream outfile("server.output");
 
 DPDKHandler::DPDKHandler() {}
 
@@ -411,8 +411,8 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
 
     if (likely(nb_pkts > 0)) {
       uint16_t nb_sent = rte_eth_tx_burst(port, queue_id, tx_pkts, nb_pkts);
-
       if (unlikely(nb_sent < nb_pkts)) {
+        RTE_LOG(ERR, TX, "[core %u] Send fail\n", lcore_id);
         for (auto i : range(nb_sent, nb_pkts)) {
           rte_pktmbuf_free(tx_pkts[i]);
         }
@@ -542,8 +542,6 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
             return;
           }
 
-          RTE_LOG(ERR, DB, "[core %u] Redis WRITE success\n", lcore_id);
-
           uint16_t ret = rte_ring_mp_enqueue_bulk(
               tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
               mbufs.size(), nullptr);
@@ -585,8 +583,6 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
             return;
           }
 
-          RTE_LOG(ERR, DB, "[core %u] Redis READ success\n", lcore_id);
-
           auto& vec = std::get<0>(*resps).value();
 
           for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
@@ -626,6 +622,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           RTE_LOG(WARNING, DB, "[core %u] Invalid DB ID: %u\n", lcore_id,
                   req->db_id);
           rte_pktmbuf_free(req->mbuf);
+          rte_mempool_put(ipc_mempool_, req);
           continue;
         }
 
@@ -667,14 +664,14 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
               server_instance->CacheMigrate(key, kv_migrate->migration_id);
             }
             rte_pktmbuf_free(req->mbuf);
-
+            rte_mempool_put(ipc_mempool_, req);
             flush_write_pipeline(db_idx, pipeline);
             continue;
           }
 
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
           pipeline.write_mbufs.push_back(req->mbuf);
-
+          rte_mempool_put(ipc_mempool_, req);
           if (pipeline.write_req.get_commands() >= BURST_SIZE) {
             flush_write_pipeline(db_idx, pipeline);
           }
@@ -682,7 +679,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
           pipeline.read_req.push("GET", key);
           pipeline.read_mbufs.push_back(req->mbuf);
-
+          rte_mempool_put(ipc_mempool_, req);
           if (pipeline.read_mbufs.size() >= BURST_SIZE) {
             flush_read_pipeline(db_idx, pipeline);
           }
@@ -829,7 +826,7 @@ inline void DPDKHandler::CreatPool() {
   if (rx_mbufpool_ == NULL)
     rte_exit(EXIT_FAILURE, "Cannot create rx mbuf pool\n");
 
-  ipc_mempool_ = rte_mempool_create("ipc_req_pool", 8191, sizeof(ipc_req), 0, 0,
+  ipc_mempool_ = rte_mempool_create("IPC_REQ_POOL", 8191, sizeof(ipc_req), 0, 0,
                                     NULL, NULL, NULL, NULL, rte_socket_id(), 0);
   if (ipc_mempool_ == NULL)
     rte_exit(EXIT_FAILURE, "Cannot create ipc mbuf pool\n");
@@ -933,10 +930,11 @@ void DPDKHandler::Start() {
   while (!stop_requested_.load(std::memory_order_relaxed)) {
     monitor_mempool(rx_mbufpool_);
     monitor_mempool(tx_mbufpool_);
+    monitor_mempool(ipc_mempool_);
 
-    for (auto i : range(RX_CORE_NUM))
-      std::cout << rte_eth_rx_queue_count(port, i) << " | ";
-    std::cout << std::endl;
+    // for (auto i : range(RX_CORE_NUM))
+    //   std::cout << rte_eth_rx_queue_count(port, i) << " | ";
+    // std::cout << std::endl;
 
     rte_delay_us_sleep(1000'000);
   }
