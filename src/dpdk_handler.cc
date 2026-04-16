@@ -521,10 +521,10 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         auto* kv_hdr =
             rte_pktmbuf_mtod_offset(mbuf, KVRequest*, KV_HEADER_OFFSET);
         uint8_t is_req = GET_IS_REQ(kv_hdr->combined);
-        std::string key(kv_hdr->key.data(), KEY_LENGTH);
+        std::string_view key(kv_hdr->key.data(), KEY_LENGTH);
 
         if (GET_OP(kv_hdr->combined) == WRITE_REQUEST) {
-          std::string value(kv_hdr->value1.data(), VALUE_LENGTH * 4);
+          std::string_view value(kv_hdr->value1.data(), VALUE_LENGTH * 4);
 
           auto db_req = std::make_shared<redis::request>();
           db_req->push("SET", key, value);
