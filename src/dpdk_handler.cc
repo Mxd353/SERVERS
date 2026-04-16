@@ -465,12 +465,16 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     conns.push_back(conn);
   }
 
-  std::thread io_thread([&ioc, lcore_id] {
-    try {
-      ioc.run();
-    } catch (const std::exception& e) {
-      RTE_LOG(ERR, WORKER, "[core %u] IO context exception: %s\n", lcore_id,
-              e.what());
+  std::thread io_thread([&ioc, lcore_id, this] {
+    while (!stop_requested_.load(std::memory_order_relaxed)) {
+      try {
+        ioc.restart();
+        ioc.run();
+        break;
+      } catch (const std::exception& e) {
+        RTE_LOG(ERR, WORKER, "[core %u] IO context exception: %s\n", lcore_id,
+                e.what());
+      }
     }
   });
 
@@ -550,28 +554,29 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
           auto db_req = std::make_shared<redis::request>();
           db_req->push("GET", key);
-          auto resp = std::make_shared<redis::response<std::string>>();
+          auto resp =
+              std::make_shared<redis::response<std::optional<std::string>>>();
 
           conns[db_idx]->async_exec(
               *db_req, *resp,
               [mbuf, db_req, resp, tx_ring, lcore_id](auto ec, auto) {
                 if (ec) {
-                  RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n", lcore_id,
-                          ec.message().c_str());
+                  RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n",
+                          lcore_id, ec.message().c_str());
                   rte_pktmbuf_free(mbuf);
                   return;
                 }
 
-                auto val = std::get<0>(*resp).value();
-                if (val.empty()) {
+                auto& val = std::get<0>(*resp).value();
+                if (!val.has_value() || val->empty()) {
                   rte_pktmbuf_free(mbuf);
                   return;
                 }
                 auto* kv_h =
                     rte_pktmbuf_mtod_offset(mbuf, KVRequest*, KV_HEADER_OFFSET);
 
-                rte_memcpy(kv_h->value1.data(), val.data(),
-                           std::min(val.size(),
+                rte_memcpy(kv_h->value1.data(), val->data(),
+                           std::min(val->size(),
                                     static_cast<size_t>(VALUE_LENGTH * 4)));
 
                 uint16_t ret = rte_ring_mp_enqueue(tx_ring, mbuf);
