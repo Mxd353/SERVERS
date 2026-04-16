@@ -458,7 +458,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   std::array<std::shared_ptr<redis::connection>, REDIS_CONNS_PER_WORKER> conns;
   for (uint32_t i = 0; i < REDIS_CONNS_PER_WORKER; i++) {
     redis::config cfg;
-    cfg.unix_socket = "/tmp/redis." + std::to_string(i);
+    cfg.unix_socket = REDIS_SOCKET_PATH + std::to_string(i);
     conns[i] =
         std::make_shared<redis::connection>(ioc, redis::logger::level::err);
     conns[i]->async_run(cfg, net::consign(net::detached, conns[i]));
