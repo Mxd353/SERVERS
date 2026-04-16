@@ -341,6 +341,8 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
               rte_pktmbuf_free(rx_pkts[i]);
               rte_mempool_put(ipc_mempool_, req);
             }
+          } else {
+            rte_pktmbuf_free(rx_pkts[i]);
           }
         }
       }
@@ -447,7 +449,10 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   if (end_db >= TOTAL_DB_NUM) end_db = TOTAL_DB_NUM - 1;
   const uint32_t db_count = end_db - start_db + 1;
 
+  std::atomic<uint32_t> inflight{0};
+
   net::io_context ioc;
+  auto work_guard = net::make_work_guard(ioc);  // 保持 io_context 运行
 
   std::vector<std::shared_ptr<redis::connection>> conns;
   conns.reserve(db_count);
@@ -465,26 +470,33 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     conns.push_back(conn);
   }
 
-  std::thread io_thread([&ioc, lcore_id, this] {
-    while (!stop_requested_.load(std::memory_order_relaxed)) {
-      try {
-        ioc.restart();
-        ioc.run();
-        break;
-      } catch (const std::exception& e) {
-        RTE_LOG(ERR, WORKER, "[core %u] IO context exception: %s\n", lcore_id,
-                e.what());
-      }
+  std::thread io_thread([&ioc, lcore_id] {
+    try {
+      ioc.run();
+    } catch (const std::exception& e) {
+      RTE_LOG(ERR, WORKER, "[core %u] IO context exception: %s\n", lcore_id,
+              e.what());
     }
   });
 
   RTE_LOG(NOTICE, WORKER, "[core %u] handles DBs: %u ~ %u\n", lcore_id,
           start_db, end_db);
 
+  auto last_log_time = std::chrono::steady_clock::now();
+
   while (!stop_requested_.load(std::memory_order_relaxed)) {
     struct ipc_req* reqs[BURST_SIZE];
     const uint16_t nb_rx =
-        rte_ring_sc_dequeue_bulk(rx_ring, (void**)reqs, BURST_SIZE, nullptr);
+        rte_ring_sc_dequeue_burst(rx_ring, (void**)reqs, BURST_SIZE, nullptr);
+
+    // 每秒打印 inflight 状态
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_log_time >= std::chrono::seconds(1) &&
+        inflight.load(std::memory_order_relaxed) > 0) {
+      RTE_LOG(NOTICE, WORKER, "[core %u] inflight=%u\n", lcore_id,
+              inflight.load(std::memory_order_relaxed));
+      last_log_time = now;
+    }
 
     if (nb_rx > 0) {
       for (auto i : range(nb_rx)) {
@@ -492,6 +504,12 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         const uint32_t db_id = reqs[i]->db_id;
         const auto src_ip = reqs[i]->src_ip;
         rte_mempool_put(ipc_mempool_, reqs[i]);
+
+        if (inflight.load(std::memory_order_relaxed) >=
+            MAX_INFLIGHT_PER_WORKER) {
+          rte_pktmbuf_free(mbuf);
+          continue;
+        }
 
         const uint32_t db_idx = db_id - start_db;
         if (unlikely(db_idx >= db_count)) {
@@ -521,8 +539,11 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
             rte_pktmbuf_free(mbuf);
 
+            inflight.fetch_add(1, std::memory_order_relaxed);
             conns[db_idx]->async_exec(
-                *db_req, redis::ignore, [db_req, lcore_id](auto ec, auto) {
+                *db_req, redis::ignore,
+                [db_req, &inflight, lcore_id](auto ec, auto) {
+                  inflight.fetch_sub(1, std::memory_order_relaxed);
                   if (ec) {
                     RTE_LOG(ERR, DB, "[core %u] Redis WRITE error: %s\n",
                             lcore_id, ec.message().c_str());
@@ -533,9 +554,11 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
 
+          inflight.fetch_add(1, std::memory_order_relaxed);
           conns[db_idx]->async_exec(
               *db_req, redis::ignore,
-              [mbuf, db_req, tx_ring, lcore_id](auto ec, auto) {
+              [mbuf, db_req, tx_ring, &inflight, lcore_id](auto ec, auto) {
+                inflight.fetch_sub(1, std::memory_order_relaxed);
                 if (ec) {
                   RTE_LOG(ERR, DB, "[core %u] Redis WRITE error: %s\n",
                           lcore_id, ec.message().c_str());
@@ -557,12 +580,15 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           auto resp =
               std::make_shared<redis::response<std::optional<std::string>>>();
 
+          inflight.fetch_add(1, std::memory_order_relaxed);
           conns[db_idx]->async_exec(
               *db_req, *resp,
-              [mbuf, db_req, resp, tx_ring, lcore_id](auto ec, auto) {
+              [mbuf, db_req, resp, tx_ring, &inflight, lcore_id](auto ec,
+                                                                 auto) {
+                inflight.fetch_sub(1, std::memory_order_relaxed);
                 if (ec) {
-                  RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n",
-                          lcore_id, ec.message().c_str());
+                  RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n", lcore_id,
+                          ec.message().c_str());
                   rte_pktmbuf_free(mbuf);
                   return;
                 }
@@ -592,6 +618,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
       rte_pause();
     }
   }
+  work_guard.reset();  // 允许 io_context 退出
   ioc.stop();
   if (io_thread.joinable()) io_thread.join();
 }
@@ -653,11 +680,10 @@ inline void DPDKHandler::InitAndLaunchCores() {
 inline void DPDKHandler::CreatPool() {
   uint nb_ports = rte_eth_dev_count_avail();
 
-  mbufpool_ = rte_pktmbuf_pool_create(
-      "MBUF_POOL", MBUF_NUM * nb_ports, MBUF_CACHE_SIZE, 0,
-      MBUF_DATA_SIZE, rte_socket_id());
-  if (mbufpool_ == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+  mbufpool_ =
+      rte_pktmbuf_pool_create("MBUF_POOL", MBUF_NUM * nb_ports, MBUF_CACHE_SIZE,
+                              0, MBUF_DATA_SIZE, rte_socket_id());
+  if (mbufpool_ == NULL) rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
 
   ipc_mempool_ = rte_mempool_create("IPC_REQ_POOL", 8191, sizeof(ipc_req), 0, 0,
                                     NULL, NULL, NULL, NULL, rte_socket_id(), 0);
@@ -764,11 +790,26 @@ void DPDKHandler::Start() {
     monitor_mempool(mbufpool_);
     monitor_mempool(ipc_mempool_);
 
-    // for (auto i : range(RX_CORE_NUM))
-    //   std::cout << rte_eth_rx_queue_count(port, i) << " | ";
-    // std::cout << std::endl;
+    // 监控 ring 使用情况
+    std::cout << "[RX_QUEUE]: ";
+    for (auto i : range(RX_CORE_NUM))
+      std::cout << rte_eth_rx_queue_count(port, i) << " | ";
+    std::cout << std::endl;
 
-    rte_delay_us_sleep(1000'000);
+    std::cout << "[RX_RING]: ";
+    for (auto i : range(RX_CORE_NUM))
+      std::cout << rte_ring_count(rx_rings_[i]) << " | ";
+    std::cout << std::endl;
+
+    std::cout << "[TX_RING]: ";
+    for (auto i : range(TX_CORE_NUM))
+      std::cout << rte_ring_count(tx_rings_[i]) << " | ";
+    std::cout << std::endl;
+
+    // 分段 sleep，每 100ms 检查一次停止请求
+    for (int i = 0; i < 20 && !stop_requested_.load(std::memory_order_relaxed); i++) {
+      rte_delay_us_sleep(100'000);
+    }
   }
 
   rte_eal_mp_wait_lcore();

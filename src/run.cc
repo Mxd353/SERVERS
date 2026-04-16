@@ -17,6 +17,13 @@ extern std::atomic<uint64_t> total_latency_us;
 extern std::atomic<size_t> completed_request_count;
 
 void signalHandler(int signal) {
+  static std::atomic<bool> handling{false};
+  
+  // 防止重入
+  if (handling.exchange(true)) {
+    return;
+  }
+
   std::cout << "\nReceived shutdown signal: " << signal << std::endl;
 
   uint64_t completed = completed_request_count.load(std::memory_order_relaxed);
@@ -42,8 +49,6 @@ void signalHandler(int signal) {
             << "Average Latency per Request (ms/op): "
             << latency_us_per_request / 1'000.0 << "( "
             << latency_us_per_request << " us/op)" << std::endl;
-
-  // Let main return normally to trigger destructors
 }
 
 void parseClusterInfo(const std::string& server_conf,

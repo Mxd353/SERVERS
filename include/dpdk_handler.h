@@ -39,49 +39,9 @@ constexpr uint32_t RACK_PER_WORKER = NUM_RACKS / WORKER_CORE_NUM;
 constexpr uint32_t DB_PER_RACK = 32;
 constexpr uint32_t TOTAL_DB_NUM = DB_PER_RACK * NUM_RACKS;
 constexpr uint32_t DBS_PER_WORKER = TOTAL_DB_NUM / WORKER_CORE_NUM;
-constexpr double REDIS_RATE_LIMIT_QPS = 1000.0;  // 每个 Redis 限速 1000 QPS
+constexpr uint32_t MAX_INFLIGHT_PER_WORKER = 4096;
 
 extern std::atomic<uint32_t> next_db_id;
-
-// 令牌桶限速器
-struct TokenBucket {
-  using Clock = std::chrono::steady_clock;
-  using TimePoint = Clock::time_point;
-  using Duration = Clock::duration;
-
-  std::atomic<double> tokens{REDIS_RATE_LIMIT_QPS};
-  std::atomic<uint64_t> last_update_ns;  // 存储纳秒时间戳
-  const double max_tokens{REDIS_RATE_LIMIT_QPS};
-  const double rate_per_sec{REDIS_RATE_LIMIT_QPS};
-
-  TokenBucket() {
-    auto now = Clock::now().time_since_epoch();
-    last_update_ns.store(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(),
-        std::memory_order_relaxed);
-  }
-
-  // 尝试消费令牌，返回是否成功
-  bool TryConsume(double consume = 1.0) {
-    auto now = Clock::now();
-    uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          now.time_since_epoch())
-                          .count();
-    auto prev_ns = last_update_ns.load(std::memory_order_relaxed);
-
-    // 计算时间差（秒），添加新令牌
-    double elapsed = static_cast<double>(now_ns - prev_ns) / 1e9;
-    double current = tokens.load(std::memory_order_relaxed);
-    double new_tokens = std::min(current + elapsed * rate_per_sec, max_tokens);
-
-    if (new_tokens >= consume) {
-      tokens.store(new_tokens - consume, std::memory_order_relaxed);
-      last_update_ns.store(now_ns, std::memory_order_relaxed);
-      return true;
-    }
-    return false;
-  }
-};
 
 class DPDKHandler {
  public:
