@@ -39,7 +39,10 @@ constexpr uint32_t RACK_PER_WORKER = NUM_RACKS / WORKER_CORE_NUM;
 constexpr uint32_t DB_PER_RACK = 32;
 constexpr uint32_t TOTAL_DB_NUM = DB_PER_RACK * NUM_RACKS;
 constexpr uint32_t DBS_PER_WORKER = TOTAL_DB_NUM / WORKER_CORE_NUM;
-constexpr uint32_t MAX_INFLIGHT_PER_WORKER = 4096;
+constexpr uint32_t MAX_INFLIGHT_PER_WORKER = 8192;
+constexpr uint32_t REDIS_CONNS_PER_WORKER = 16;
+constexpr auto PIPELINE_FLUSH_INTERVAL = std::chrono::milliseconds(1);
+constexpr const char* REDIS_SOCKET_PATH = "/tmp/redis.0";
 
 extern std::atomic<uint32_t> next_db_id;
 
