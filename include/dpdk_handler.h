@@ -20,11 +20,9 @@
 #define RTE_LOGTYPE_TX RTE_LOGTYPE_USER5
 #define RTE_LOGTYPE_RX RTE_LOGTYPE_USER6
 
-#define TX_NUM_MBUFS 16'383
-#define RX_NUM_MBUFS 32'767
+#define MBUF_NUM 49'150
 #define MBUF_CACHE_SIZE 256
-#define TX_MBUF_DATA_SIZE 256
-#define RX_MBUF_DATA_SIZE 512
+#define MBUF_DATA_SIZE 512
 #define BURST_SIZE 32
 #define RX_RING_SIZE 2048
 #define TX_RING_SIZE 1024
@@ -105,8 +103,7 @@ class DPDKHandler {
  private:
   volatile bool initialized_ = false;
   std::atomic<bool> stop_requested_{false};
-  rte_mempool* tx_mbufpool_;
-  rte_mempool* rx_mbufpool_;
+  rte_mempool* mbufpool_;
   rte_mempool* ipc_mempool_;
   int ret_;
   rte_ether_addr s_eth_addr_;

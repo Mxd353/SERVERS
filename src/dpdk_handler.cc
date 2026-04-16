@@ -196,7 +196,7 @@ int DPDKHandler::PortInit() {
 
       retval = rte_eth_rx_queue_setup(port, rx_count, rx_ring_size,
                                       rte_eth_dev_socket_id(port), &rx_conf,
-                                      rx_mbufpool_);
+                                      mbufpool_);
       if (retval < 0) return retval;
       core.queue_id = rx_count;
       rx_count++;
@@ -373,14 +373,14 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
       uint16_t mig_sent = 0;
       for (auto i : range(nb_mig)) {
         Packet* packet = mig_packets[i];
-        if (unlikely(packet->size() > TX_MBUF_DATA_SIZE)) {
+        if (unlikely(packet->size() > MBUF_DATA_SIZE)) {
           RTE_LOG(WARNING, TX, "[core %u] Migration packet too large: %zu\n",
                   lcore_id, packet->size());
           delete packet;
           continue;
         }
 
-        rte_mbuf* mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
+        rte_mbuf* mbuf = rte_pktmbuf_alloc(mbufpool_);
         if (unlikely(mbuf == nullptr)) {
           RTE_LOG(ERR, TX, "[core %u] Failed to allocate mbuf\n", lcore_id);
           delete packet;
@@ -653,17 +653,11 @@ inline void DPDKHandler::InitAndLaunchCores() {
 inline void DPDKHandler::CreatPool() {
   uint nb_ports = rte_eth_dev_count_avail();
 
-  tx_mbufpool_ = rte_pktmbuf_pool_create(
-      "TX_MBUF_POOL", TX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
-      TX_MBUF_DATA_SIZE, rte_socket_id());
-  if (tx_mbufpool_ == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create tx mbuf pool\n");
-
-  rx_mbufpool_ = rte_pktmbuf_pool_create(
-      "RX_MBUF_POOL", RX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
-      RX_MBUF_DATA_SIZE, rte_socket_id());
-  if (rx_mbufpool_ == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create rx mbuf pool\n");
+  mbufpool_ = rte_pktmbuf_pool_create(
+      "MBUF_POOL", MBUF_NUM * nb_ports, MBUF_CACHE_SIZE, 0,
+      MBUF_DATA_SIZE, rte_socket_id());
+  if (mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
 
   ipc_mempool_ = rte_mempool_create("IPC_REQ_POOL", 8191, sizeof(ipc_req), 0, 0,
                                     NULL, NULL, NULL, NULL, rte_socket_id(), 0);
@@ -767,8 +761,7 @@ void DPDKHandler::Start() {
   LaunchThreads();
 
   while (!stop_requested_.load(std::memory_order_relaxed)) {
-    monitor_mempool(rx_mbufpool_);
-    monitor_mempool(tx_mbufpool_);
+    monitor_mempool(mbufpool_);
     monitor_mempool(ipc_mempool_);
 
     // for (auto i : range(RX_CORE_NUM))
