@@ -135,10 +135,12 @@ int DPDKHandler::PortInit() {
   struct rte_eth_rxmode tmp_rxmode;
   memset(&tmp_rxmode, 0, sizeof(rte_eth_rxmode));
   tmp_rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-  tmp_rxmode.mtu = TX_MBUF_DATA_SIZE;
+  tmp_rxmode.mtu = 256;
 
   rte_eth_rss_conf rss_conf;
-  rss_conf.rss_hf = RTE_ETH_RSS_IP;
+  rss_conf.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP;
+  rss_conf.rss_key_len = 0;
+  rss_conf.rss_key = NULL;
 
   port_conf_default.rxmode = tmp_rxmode;
   port_conf_default.rx_adv_conf.rss_conf = rss_conf;
@@ -193,7 +195,7 @@ int DPDKHandler::PortInit() {
       assert(rx_count < nb_rx_cores);
 
       retval = rte_eth_rx_queue_setup(port, rx_count, rx_ring_size,
-                                      rte_eth_dev_socket_id(port), NULL,
+                                      rte_eth_dev_socket_id(port), &rx_conf,
                                       rx_mbufpool_);
       if (retval < 0) return retval;
       core.queue_id = rx_count;
@@ -286,8 +288,7 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           "not be optimal.\n",
           port);
 
-    RTE_LOG(NOTICE, CORE, "[Rx Core %u] polling queue: %hu\n", lcore_id,
-            queue_id);
+    RTE_LOG(NOTICE, RX, "[core %u] polling queue: %hu\n", lcore_id, queue_id);
 
     rte_mbuf* rx_pkts[BURST_SIZE];
     while (!stop_requested_.load(std::memory_order_relaxed)) {
@@ -324,9 +325,9 @@ void DPDKHandler::RxLoop(CoreInfo core_info) {
           uint16_t worker_id, db_id;
           if (LookupWorker(ip_be, worker_id, db_id) != 0) {
             rte_pktmbuf_free(rx_pkts[i]);
-            RTE_LOG(WARNING, DB,
-                    "Not find worker for [%d.%d.%d.%d] in core: %u\n",
-                    DECODE_IP(ip_be), lcore_id);
+            RTE_LOG(WARNING, RX,
+                    "[core %u] Not find worker for [%d.%d.%d.%d]\n", lcore_id,
+                    DECODE_IP(ip_be));
             continue;
           }
 
@@ -357,8 +358,7 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
   uint16_t queue_id = core_info.queue_id;
   auto* tx_ring = core_info.tx_ring;
 
-  RTE_LOG(NOTICE, CORE, "[TX Core %u] polling queue: %hu\n", lcore_id,
-          queue_id);
+  RTE_LOG(NOTICE, TX, "[core %u] polling queue: %hu\n", lcore_id, queue_id);
 
   rte_mbuf* tx_pkts[BURST_SIZE];
   Packet* mig_packets[BURST_SIZE];
@@ -374,17 +374,15 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
       for (auto i : range(nb_mig)) {
         Packet* packet = mig_packets[i];
         if (unlikely(packet->size() > TX_MBUF_DATA_SIZE)) {
-          RTE_LOG(WARNING, CORE,
-                  "[TX Core %u] Migration packet too large: %zu\n", lcore_id,
-                  packet->size());
+          RTE_LOG(WARNING, TX, "[core %u] Migration packet too large: %zu\n",
+                  lcore_id, packet->size());
           delete packet;
           continue;
         }
 
         rte_mbuf* mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
         if (unlikely(mbuf == nullptr)) {
-          RTE_LOG(ERR, CORE, "[TX Core %u] Failed to allocate mbuf\n",
-                  lcore_id);
+          RTE_LOG(ERR, TX, "[core %u] Failed to allocate mbuf\n", lcore_id);
           delete packet;
           continue;
         }
@@ -427,7 +425,7 @@ void DPDKHandler::TxLoop(CoreInfo core_info) {
     }
   }
 
-  RTE_LOG(NOTICE, CORE, "[TX Core %u] exiting\n", lcore_id);
+  RTE_LOG(NOTICE, TX, "[core %u] exiting\n", lcore_id);
 }
 
 void DPDKHandler::DBWorker(CoreInfo core_info) {
@@ -442,7 +440,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   uint32_t end_db = start_db + DBS_PER_WORKER - 1;
 
   if (start_db >= TOTAL_DB_NUM) {
-    RTE_LOG(ERR, WORKER, "[Worker core %u] has no DB to handle.\n", lcore_id);
+    RTE_LOG(ERR, WORKER, "[core %u] has no DB to handle.\n", lcore_id);
     return;
   }
 
@@ -466,15 +464,16 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     conns.push_back(conn);
   }
 
-  std::thread io_thread([&ioc] {
+  std::thread io_thread([&ioc, lcore_id] {
     try {
       ioc.run();
     } catch (const std::exception& e) {
-      RTE_LOG(ERR, WORKER, "IO context exception: %s\n", e.what());
+      RTE_LOG(ERR, WORKER, "[core %u] IO context exception: %s\n", lcore_id,
+              e.what());
     }
   });
 
-  RTE_LOG(NOTICE, WORKER, "[Worker core %u] handles DBs: %u ~ %u\n", lcore_id,
+  RTE_LOG(NOTICE, WORKER, "[core %u] handles DBs: %u ~ %u\n", lcore_id,
           start_db, end_db);
 
   struct DBPipeline {
@@ -532,16 +531,18 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     conn->async_exec(
         req_copy, redis::ignore,
         [mbufs = std::move(mbufs_copy), tx_ring,
-         &inflight = db_inflight[db_idx]](auto ec, auto) {
+         &inflight = db_inflight[db_idx], lcore_id](auto ec, auto) {
           inflight.fetch_sub(mbufs.size(), std::memory_order_relaxed);
 
           if (ec) {
-            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
-                    rte_lcore_id(), ec.message().c_str());
+            RTE_LOG(ERR, DB, "[core %u] Redis WRITE error: %s\n", lcore_id,
+                    ec.message().c_str());
             for (auto* m : mbufs) rte_pktmbuf_free(m);
             return;
           }
 
+          RTE_LOG(ERR, DB, "[core %u] Redis WRITE success\n", lcore_id);
+          
           uint16_t ret = rte_ring_mp_enqueue_bulk(
               tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
               mbufs.size(), nullptr);
@@ -573,15 +574,17 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     conn->async_exec(
         std::move(req_copy), *resps,
         [resps, tx_ring, mbufs = std::move(mbufs_copy),
-         &inflight = db_inflight[db_idx]](auto ec, auto) mutable {
+         &inflight = db_inflight[db_idx], lcore_id](auto ec, auto) mutable {
           inflight.fetch_sub(mbufs.size(), std::memory_order_relaxed);
 
           if (ec) {
-            RTE_LOG(ERR, WORKER, "[Worker %u] Redis error: %s\n",
-                    rte_lcore_id(), ec.message().c_str());
+            RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n", lcore_id,
+                    ec.message().c_str());
             for (auto* m : mbufs) rte_pktmbuf_free(m);
             return;
           }
+
+          RTE_LOG(ERR, DB, "[core %u] Redis READ success\n", lcore_id);
 
           auto& vec = std::get<0>(*resps).value();
 
@@ -619,8 +622,8 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
         const uint32_t db_idx = req->db_id - start_db;
         if (unlikely(db_idx >= db_count)) {
-          RTE_LOG(WARNING, WORKER, "[Worker core %u] Invalid DB ID: %u\n",
-                  lcore_id, req->db_id);
+          RTE_LOG(WARNING, DB, "[core %u] Invalid DB ID: %u\n", lcore_id,
+                  req->db_id);
           rte_pktmbuf_free(req->mbuf);
           continue;
         }
@@ -633,12 +636,12 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           continue;
         }
 
-        // 限速检查：超过 1000 QPS 直接丢弃请求
-        if (!rate_limiters[db_idx]->TryConsume()) {
-          rte_pktmbuf_free(req->mbuf);
-          rte_mempool_put(ipc_mempool_, req);
-          continue;
-        }
+        // // 限速检查：超过 1000 QPS 直接丢弃请求
+        // if (!rate_limiters[db_idx]->TryConsume()) {
+        //   rte_pktmbuf_free(req->mbuf);
+        //   rte_mempool_put(ipc_mempool_, req);
+        //   continue;
+        // }
 
         auto& pipeline = pipelines[db_idx];
         if (!is_db_active[db_idx]) {

@@ -7,10 +7,9 @@
 #include <rte_mbuf.h>
 
 #include <atomic>
-#include <chrono>
-
 #include <boost/asio.hpp>
 #include <boost/redis.hpp>
+#include <chrono>
 
 #include "server_instance.h"
 
@@ -18,6 +17,8 @@
 #define RTE_LOGTYPE_DB RTE_LOGTYPE_USER2
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
 #define RTE_LOGTYPE_WORKER RTE_LOGTYPE_USER4
+#define RTE_LOGTYPE_TX RTE_LOGTYPE_USER5
+#define RTE_LOGTYPE_RX RTE_LOGTYPE_USER6
 
 #define TX_NUM_MBUFS 16'383
 #define RX_NUM_MBUFS 32'767
@@ -57,15 +58,17 @@ struct TokenBucket {
 
   TokenBucket() {
     auto now = Clock::now().time_since_epoch();
-    last_update_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(),
-                         std::memory_order_relaxed);
+    last_update_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(),
+        std::memory_order_relaxed);
   }
 
   // 尝试消费令牌，返回是否成功
   bool TryConsume(double consume = 1.0) {
     auto now = Clock::now();
     uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          now.time_since_epoch()).count();
+                          now.time_since_epoch())
+                          .count();
     auto prev_ns = last_update_ns.load(std::memory_order_relaxed);
 
     // 计算时间差（秒），添加新令牌
