@@ -477,277 +477,115 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   RTE_LOG(NOTICE, WORKER, "[core %u] handles DBs: %u ~ %u\n", lcore_id,
           start_db, end_db);
 
-  struct DBPipeline {
-    redis::request read_req;
-    redis::request write_req;
-
-    std::vector<rte_mbuf*> read_mbufs;
-    std::vector<rte_mbuf*> write_mbufs;
-
-    std::chrono::steady_clock::time_point last_read_flush;
-    std::chrono::steady_clock::time_point last_write_flush;
-  };
-
-  const uint32_t MAX_INFLIGHT_WINDOW = 128;
-
-  std::vector<std::atomic<uint32_t>> db_inflight(db_count);
-  for (auto& x : db_inflight) x.store(0);
-
-  // 记录当前有数据积压的 DB 索引
-  std::vector<uint32_t> active_dbs;
-  active_dbs.reserve(db_count);
-  std::vector<bool> is_db_active(db_count, false);
-
-  std::vector<DBPipeline> pipelines(db_count);
-  auto base_time = std::chrono::steady_clock::now();
-
-  // 为每个 DB 创建 TokenBucket 限速器
-  std::vector<std::unique_ptr<TokenBucket>> rate_limiters;
-  rate_limiters.reserve(db_count);
-  for (auto i : range(db_count)) {
-    rate_limiters.emplace_back(std::make_unique<TokenBucket>());
-    auto& p = pipelines[i];
-    p.read_mbufs.reserve(BURST_SIZE);
-    p.write_mbufs.reserve(BURST_SIZE);
-    auto stagger = std::chrono::microseconds(i * 10);
-    p.last_write_flush = base_time + stagger;
-    p.last_read_flush = base_time + stagger;
-  }
-
-  // Lambda to flush write pipeline
-  auto flush_write_pipeline = [&](uint32_t db_idx, DBPipeline& pipeline) {
-    uint32_t batch_size = pipeline.write_req.get_commands();
-    if (batch_size == 0) return;
-
-    auto conn = conns[db_idx];
-    auto req_copy = std::move(pipeline.write_req);
-    auto mbufs_copy = std::move(pipeline.write_mbufs);
-
-    pipeline.write_req = redis::request{};
-    pipeline.write_mbufs.clear();
-    pipeline.last_write_flush = std::chrono::steady_clock::now();
-
-    db_inflight[db_idx].fetch_add(batch_size, std::memory_order_relaxed);
-
-    conn->async_exec(
-        req_copy, redis::ignore,
-        [mbufs = std::move(mbufs_copy), tx_ring,
-         &inflight = db_inflight[db_idx], lcore_id](auto ec, auto) {
-          inflight.fetch_sub(mbufs.size(), std::memory_order_relaxed);
-
-          if (ec) {
-            RTE_LOG(ERR, DB, "[core %u] Redis WRITE error: %s\n", lcore_id,
-                    ec.message().c_str());
-            for (auto* m : mbufs) rte_pktmbuf_free(m);
-            return;
-          }
-
-          uint16_t ret = rte_ring_mp_enqueue_bulk(
-              tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
-              mbufs.size(), nullptr);
-          if (ret < mbufs.size()) {
-            for (auto i : range(ret, mbufs.size())) {
-              rte_pktmbuf_free(mbufs[i]);
-            }
-          }
-        });
-  };
-
-  // Lambda to flush read pipeline
-  auto flush_read_pipeline = [&](uint32_t db_idx, DBPipeline& pipeline) {
-    uint32_t batch_size = pipeline.read_mbufs.size();
-    if (batch_size == 0) return;
-
-    auto conn = conns[db_idx];
-    auto req_copy = std::move(pipeline.read_req);
-    auto mbufs_copy = std::move(pipeline.read_mbufs);
-
-    pipeline.read_req = redis::request{};
-    pipeline.read_mbufs.clear();
-    pipeline.last_read_flush = std::chrono::steady_clock::now();
-
-    db_inflight[db_idx].fetch_add(batch_size, std::memory_order_relaxed);
-
-    auto resps = std::make_shared<redis::response<std::vector<std::string>>>();
-
-    conn->async_exec(
-        std::move(req_copy), *resps,
-        [resps, tx_ring, mbufs = std::move(mbufs_copy),
-         &inflight = db_inflight[db_idx], lcore_id](auto ec, auto) mutable {
-          inflight.fetch_sub(mbufs.size(), std::memory_order_relaxed);
-
-          if (ec) {
-            RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n", lcore_id,
-                    ec.message().c_str());
-            for (auto* m : mbufs) rte_pktmbuf_free(m);
-            return;
-          }
-
-          auto& vec = std::get<0>(*resps).value();
-
-          for (size_t i = 0; i < vec.size() && i < mbufs.size(); ++i) {
-            auto* kv_h =
-                rte_pktmbuf_mtod_offset(mbufs[i], KVRequest*, KV_HEADER_OFFSET);
-
-            const std::string& val = vec[i];
-            if (!val.empty()) {
-              rte_memcpy(
-                  kv_h->value1.data(), val.data(),
-                  std::min(val.size(), static_cast<size_t>(VALUE_LENGTH * 4)));
-            }
-          }
-
-          uint16_t ret = rte_ring_mp_enqueue_bulk(
-              tx_ring, reinterpret_cast<void* const*>(mbufs.data()),
-              mbufs.size(), nullptr);
-          if (ret < mbufs.size()) {
-            for (auto i : range(ret, mbufs.size())) rte_pktmbuf_free(mbufs[i]);
-          }
-        });
-  };
-
   while (!stop_requested_.load(std::memory_order_relaxed)) {
     struct ipc_req* reqs[BURST_SIZE];
     const uint16_t nb_rx =
         rte_ring_sc_dequeue_bulk(rx_ring, (void**)reqs, BURST_SIZE, nullptr);
 
-    auto current_time = std::chrono::steady_clock::now();
-
     if (nb_rx > 0) {
       for (auto i : range(nb_rx)) {
         auto& req = reqs[i];
+        auto* mbuf = req->mbuf;
 
         const uint32_t db_idx = req->db_id - start_db;
         if (unlikely(db_idx >= db_count)) {
           RTE_LOG(WARNING, DB, "[core %u] Invalid DB ID: %u\n", lcore_id,
                   req->db_id);
-          rte_pktmbuf_free(req->mbuf);
+          rte_pktmbuf_free(mbuf);
           rte_mempool_put(ipc_mempool_, req);
           continue;
         }
-
-        if (unlikely(db_inflight[db_idx].load(std::memory_order_relaxed) >=
-                     MAX_INFLIGHT_WINDOW)) {
-          // 该 DB 已过载，执行丢包，保护 Worker 和其他 DB
-          rte_pktmbuf_free(req->mbuf);
-          rte_mempool_put(ipc_mempool_, req);
-          continue;
-        }
-
-        // // 限速检查：超过 1000 QPS 直接丢弃请求
-        // if (!rate_limiters[db_idx]->TryConsume()) {
-        //   rte_pktmbuf_free(req->mbuf);
-        //   rte_mempool_put(ipc_mempool_, req);
-        //   continue;
-        // }
-
-        auto& pipeline = pipelines[db_idx];
-        if (!is_db_active[db_idx]) {
-          is_db_active[db_idx] = true;
-          active_dbs.push_back(db_idx);
-        }
-
         auto* kv_hdr =
-            rte_pktmbuf_mtod_offset(req->mbuf, KVRequest*, KV_HEADER_OFFSET);
+            rte_pktmbuf_mtod_offset(mbuf, KVRequest*, KV_HEADER_OFFSET);
         uint8_t is_req = GET_IS_REQ(kv_hdr->combined);
-        std::string_view key(kv_hdr->key.data(), KEY_LENGTH);
+        std::string key(kv_hdr->key.data(), KEY_LENGTH);
 
         if (GET_OP(kv_hdr->combined) == WRITE_REQUEST) {
-          std::string_view value(kv_hdr->value1.data(), VALUE_LENGTH * 4);
-          pipeline.write_req.push("SET", key, value);
+          std::string value(kv_hdr->value1.data(), VALUE_LENGTH * 4);
+
+          auto db_req = std::make_shared<redis::request>();
+          db_req->push("SET", key, value);
 
           if (is_req == CACHE_MIGRATE) {
-            auto* kv_migrate = rte_pktmbuf_mtod_offset(req->mbuf, KVMigrate*,
-                                                       KV_HEADER_OFFSET);
+            auto* kv_migrate =
+                rte_pktmbuf_mtod_offset(mbuf, KVMigrate*, KV_HEADER_OFFSET);
             auto server_instance = GetServerByIp(req->src_ip);
             if (server_instance) {
               server_instance->CacheMigrate(key, kv_migrate->migration_id);
             }
-            rte_pktmbuf_free(req->mbuf);
+
+            rte_pktmbuf_free(mbuf);
             rte_mempool_put(ipc_mempool_, req);
-            flush_write_pipeline(db_idx, pipeline);
+
+            conns[db_idx]->async_exec(
+                *db_req, redis::ignore, [db_req, lcore_id](auto ec, auto) {
+                  if (ec) {
+                    RTE_LOG(ERR, DB, "[core %u] Redis WRITE error: %s\n",
+                            lcore_id, ec.message().c_str());
+                  }
+                });
             continue;
           }
 
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
-          pipeline.write_mbufs.push_back(req->mbuf);
+
           rte_mempool_put(ipc_mempool_, req);
-          if (pipeline.write_req.get_commands() >= BURST_SIZE) {
-            flush_write_pipeline(db_idx, pipeline);
-          }
-        } else {
+
+          conns[db_idx]->async_exec(
+              *db_req, redis::ignore,
+              [mbuf, db_req, tx_ring, lcore_id](auto ec, auto) {
+                if (ec) {
+                  RTE_LOG(ERR, DB, "[core %u] Redis WRITE error: %s\n",
+                          lcore_id, ec.message().c_str());
+                  rte_pktmbuf_free(mbuf);
+                  return;
+                }
+
+                uint16_t ret = rte_ring_mp_enqueue(tx_ring, mbuf);
+                if (ret != 0) {
+                  rte_pktmbuf_free(mbuf);
+                }
+              });
+
+        } else if (GET_OP(kv_hdr->combined) == READ_REQUEST) {
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
-          pipeline.read_req.push("GET", key);
-          pipeline.read_mbufs.push_back(req->mbuf);
+
           rte_mempool_put(ipc_mempool_, req);
-          if (pipeline.read_mbufs.size() >= BURST_SIZE) {
-            flush_read_pipeline(db_idx, pipeline);
-          }
+
+          auto db_req = std::make_shared<redis::request>();
+          db_req->push("GET", key);
+          auto resp = std::make_shared<redis::response<std::string>>();
+
+          conns[db_idx]->async_exec(
+              *db_req, *resp,
+              [mbuf, db_req, resp, tx_ring, lcore_id](auto ec, auto) {
+                if (ec) {
+                  RTE_LOG(ERR, DB, "[core %u] Redis READ error: %s\n",
+                          lcore_id, ec.message().c_str());
+                  rte_pktmbuf_free(mbuf);
+                  return;
+                }
+
+                auto val = std::get<0>(*resp).value();
+                if (val.empty()) {
+                  rte_pktmbuf_free(mbuf);
+                  return;
+                }
+                auto* kv_h =
+                    rte_pktmbuf_mtod_offset(mbuf, KVRequest*, KV_HEADER_OFFSET);
+
+                rte_memcpy(kv_h->value1.data(), val.data(),
+                           std::min(val.size(),
+                                    static_cast<size_t>(VALUE_LENGTH * 4)));
+
+                uint16_t ret = rte_ring_mp_enqueue(tx_ring, mbuf);
+                if (ret != 0) {
+                  rte_pktmbuf_free(mbuf);
+                }
+              });
         }
       }
     }  // end of for (auto i : range(nb_rx))
-
-    static auto last_sched = std::chrono::steady_clock::now();
-
-    static auto sched_interval = std::chrono::microseconds(50);
-    static uint32_t consecutive_busy = 0;
-
-    if (nb_rx > BURST_SIZE * 0.8) {
-      consecutive_busy++;
-      if (consecutive_busy > 10) {
-        sched_interval =
-            std::max(sched_interval / 2, std::chrono::microseconds(10));
-        consecutive_busy = 0;
-      }
-    } else {
-      sched_interval =
-          std::min(sched_interval * 2, std::chrono::microseconds(500));
-    }
-
-    if (unlikely((current_time - last_sched) >= sched_interval)) {
-      last_sched = current_time;
-
-      std::vector<uint32_t> next_active_dbs;
-      next_active_dbs.reserve(active_dbs.size());
-
-      for (uint32_t db_idx : active_dbs) {
-        auto& pipeline = pipelines[db_idx];
-
-        if (db_inflight[db_idx].load(std::memory_order_relaxed) >=
-            MAX_INFLIGHT_WINDOW) {
-          next_active_dbs.push_back(db_idx);
-          continue;
-        }
-
-        bool still_active = false;
-
-        if (pipeline.write_req.get_commands() > 0) {
-          if ((current_time - pipeline.last_write_flush) >=
-              std::chrono::milliseconds(1)) {
-            flush_write_pipeline(db_idx, pipeline);
-          } else {
-            still_active = true;
-          }
-        }
-
-        if (!pipeline.read_mbufs.empty()) {
-          if ((current_time - pipeline.last_read_flush) >=
-              std::chrono::milliseconds(1)) {
-            flush_read_pipeline(db_idx, pipeline);
-          } else {
-            still_active = true;
-          }
-        }
-
-        if (still_active) {
-          next_active_dbs.push_back(db_idx);
-        } else {
-          is_db_active[db_idx] = false;
-        }
-      }
-
-      active_dbs = std::move(next_active_dbs);
-    }
 
     if (nb_rx == 0) {
       rte_pause();
