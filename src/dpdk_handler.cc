@@ -454,11 +454,11 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   net::io_context ioc;
   auto work_guard = net::make_work_guard(ioc);
 
-  // 创建 16 个 Redis 连接
+  // 创建 16 个 Redis 连接，每个连接到不同的 Redis 实例
   std::array<std::shared_ptr<redis::connection>, REDIS_CONNS_PER_WORKER> conns;
   for (uint32_t i = 0; i < REDIS_CONNS_PER_WORKER; i++) {
     redis::config cfg;
-    cfg.unix_socket = REDIS_SOCKET_PATH;
+    cfg.unix_socket = "/tmp/redis." + std::to_string(i);
     conns[i] =
         std::make_shared<redis::connection>(ioc, redis::logger::level::err);
     conns[i]->async_run(cfg, net::consign(net::detached, conns[i]));
@@ -533,14 +533,15 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
             auto* kv_h =
                 rte_pktmbuf_mtod_offset(m, KVRequest*, KV_HEADER_OFFSET);
-            rte_memcpy(kv_h->value1.data(), val->data(),
-                       std::min(val->size(), static_cast<size_t>(VALUE_LENGTH * 4)));
+            rte_memcpy(
+                kv_h->value1.data(), val->data(),
+                std::min(val->size(), static_cast<size_t>(VALUE_LENGTH * 4)));
 
             uint16_t ret = rte_ring_mp_enqueue(tx_ring, m);
             if (ret != 0) rte_pktmbuf_free(m);
           }
 
-          for (size_t i = results.size(); i < mbufs->size(); i++) {
+          for (auto i : range(results.size(), mbufs->size())) {
             rte_pktmbuf_free((*mbufs)[i]);
           }
         });
@@ -564,7 +565,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     }
 
     // 检查是否需要刷新 batches
-    for (uint32_t i = 0; i < REDIS_CONNS_PER_WORKER; i++) {
+    for (auto i : range(REDIS_CONNS_PER_WORKER)) {
       auto& batch = batches[i];
       bool should_flush =
           batch.mbufs.size() >= BURST_SIZE ||
@@ -685,7 +686,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   }
 
   // 退出前刷新所有 pending batches
-  for (uint32_t i = 0; i < REDIS_CONNS_PER_WORKER; i++) {
+  for (auto i : range(REDIS_CONNS_PER_WORKER)) {
     if (!batches[i].mbufs.empty()) {
       flush_batch(i);
     }
@@ -880,7 +881,8 @@ void DPDKHandler::Start() {
     std::cout << std::endl;
 
     // 分段 sleep，每 100ms 检查一次停止请求
-    for (int i = 0; i < 20 && !stop_requested_.load(std::memory_order_relaxed); i++) {
+    for (int i = 0; i < 20 && !stop_requested_.load(std::memory_order_relaxed);
+         i++) {
       rte_delay_us_sleep(100'000);
     }
   }
