@@ -449,7 +449,9 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   if (end_db >= TOTAL_DB_NUM) end_db = TOTAL_DB_NUM - 1;
   const uint32_t db_count = end_db - start_db + 1;
 
-  std::atomic<uint32_t> inflight{0};
+  // 每个连接独立的 inflight 计数
+  std::array<std::atomic<uint32_t>, REDIS_CONNS_PER_WORKER> conn_inflight;
+  for (auto& ci : conn_inflight) ci.store(0, std::memory_order_relaxed);
 
   net::io_context ioc;
   auto work_guard = net::make_work_guard(ioc);
@@ -476,25 +478,23 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   RTE_LOG(NOTICE, WORKER, "[core %u] handles DBs: %u ~ %u (%u connections)\n",
           lcore_id, start_db, end_db, REDIS_CONNS_PER_WORKER);
 
-  // Pipeline 累积结构
-  struct PipelineBatch {
+  // READ Pipeline 累积结构
+  struct ReadBatch {
     std::vector<rte_mbuf*> mbufs;
     std::vector<std::string> keys;
-    std::vector<uint64_t> timestamps;  // 每个请求的时间戳（纳秒）
+    std::vector<uint64_t> timestamps;
     std::chrono::steady_clock::time_point first_arrival;
   };
 
-  std::array<PipelineBatch, REDIS_CONNS_PER_WORKER> batches;
+  std::array<ReadBatch, REDIS_CONNS_PER_WORKER> read_batches;
 
-  // 刷新 batch 的 lambda
-  auto flush_batch = [&](uint32_t conn_idx) {
-    auto& batch = batches[conn_idx];
+  // 刷新 READ batch 的 lambda
+  auto flush_read_batch = [&](uint32_t conn_idx) {
+    auto& batch = read_batches[conn_idx];
     if (batch.mbufs.empty()) return;
 
-    auto mbufs =
-        std::make_shared<std::vector<rte_mbuf*>>(std::move(batch.mbufs));
-    auto keys =
-        std::make_shared<std::vector<std::string>>(std::move(batch.keys));
+    auto mbufs = std::make_shared<std::vector<rte_mbuf*>>(std::move(batch.mbufs));
+    auto keys = std::make_shared<std::vector<std::string>>(std::move(batch.keys));
     auto timestamps =
         std::make_shared<std::vector<uint64_t>>(std::move(batch.timestamps));
 
@@ -503,10 +503,6 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     batch.timestamps.clear();
     batch.first_arrival = {};
 
-    const size_t batch_size = mbufs->size();
-    inflight.fetch_add(batch_size, std::memory_order_relaxed);
-
-    // 使用 push_range 构建 MGET 请求
     auto db_req = std::make_shared<redis::request>();
     db_req->push_range("MGET", keys->begin(), keys->end());
 
@@ -515,9 +511,11 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
     conns[conn_idx]->async_exec(
         *db_req, *resp,
-        [mbufs, keys, timestamps, resp, tx_ring, &inflight, lcore_id](
-            auto ec, auto) {
-          inflight.fetch_sub(mbufs->size(), std::memory_order_relaxed);
+        [mbufs, keys, timestamps, resp, tx_ring, conn_idx, &conn_inflight,
+         lcore_id](auto ec, auto) {
+          for (size_t i = 0; i < mbufs->size(); i++) {
+            conn_inflight[conn_idx].fetch_sub(1, std::memory_order_relaxed);
+          }
 
           if (ec) {
             RTE_LOG(ERR, DB, "[core %u] Redis MGET error: %s\n", lcore_id,
@@ -527,14 +525,14 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           }
 
           auto& results = std::get<0>(*resp).value();
-          const auto end_time = std::chrono::steady_clock::now().time_since_epoch().count();
+          const auto end_time =
+              std::chrono::steady_clock::now().time_since_epoch().count();
 
           size_t completed = 0;
           for (size_t i = 0; i < mbufs->size() && i < results.size(); i++) {
             auto* m = (*mbufs)[i];
             auto& val = results[i];
 
-            // 延迟统计
             if (i < timestamps->size()) {
               uint64_t latency_ns = end_time - (*timestamps)[i];
               total_latency_us.fetch_add(latency_ns / 1000,
@@ -549,15 +547,13 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
             auto* kv_h =
                 rte_pktmbuf_mtod_offset(m, KVRequest*, KV_HEADER_OFFSET);
-            rte_memcpy(
-                kv_h->value1.data(), val->data(),
-                std::min(val->size(), static_cast<size_t>(VALUE_LENGTH * 4)));
+            rte_memcpy(kv_h->value1.data(), val->data(),
+                       std::min(val->size(), static_cast<size_t>(VALUE_LENGTH * 4)));
 
             uint16_t ret = rte_ring_mp_enqueue(tx_ring, m);
             if (ret != 0) rte_pktmbuf_free(m);
           }
 
-          // 处理多余的 mbufs
           for (size_t i = results.size(); i < mbufs->size(); i++) {
             if (i < timestamps->size()) {
               uint64_t latency_ns = end_time - (*timestamps)[i];
@@ -582,20 +578,25 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
     auto now = std::chrono::steady_clock::now();
 
-    // 每秒打印 inflight 状态
-    if (now - last_log_time >= std::chrono::seconds(1) &&
-        inflight.load(std::memory_order_relaxed) > 0) {
-      RTE_LOG(NOTICE, WORKER, "[core %u] inflight=%u\n", lcore_id,
-              inflight.load(std::memory_order_relaxed));
+    // 每秒打印每个连接的 inflight 状态
+    if (now - last_log_time >= std::chrono::seconds(1)) {
+      uint32_t total = 0;
+      for (uint32_t i = 0; i < REDIS_CONNS_PER_WORKER; i++) {
+        uint32_t ci = conn_inflight[i].load(std::memory_order_relaxed);
+        total += ci;
+      }
+      if (total > 0) {
+        RTE_LOG(NOTICE, WORKER, "[core %u] total inflight=%u\n", lcore_id, total);
+      }
       last_log_time = now;
     }
 
-    // 检查是否需要刷新 batches
-    for (auto i : range(REDIS_CONNS_PER_WORKER)) {
-      auto& batch = batches[i];
+    // 检查是否需要刷新 READ batches（超时）
+    for (uint32_t i = 0; i < REDIS_CONNS_PER_WORKER; i++) {
+      auto& batch = read_batches[i];
       if (batch.mbufs.size() > 0 &&
-          now - batch.first_arrival >= PIPELINE_FLUSH_INTERVAL) {
-        flush_batch(i);
+          now - batch.first_arrival >= READ_FLUSH_INTERVAL) {
+        flush_read_batch(i);
       }
     }
 
@@ -606,8 +607,12 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         const auto src_ip = reqs[i]->src_ip;
         rte_mempool_put(ipc_mempool_, reqs[i]);
 
-        if (inflight.load(std::memory_order_relaxed) >=
-            MAX_INFLIGHT_PER_WORKER) {
+        // 映射到连接: db_id % 16
+        const uint32_t conn_idx = db_id % REDIS_CONNS_PER_WORKER;
+
+        // 检查该连接的 inflight
+        if (conn_inflight[conn_idx].load(std::memory_order_relaxed) >=
+            MAX_INFLIGHT_PER_CONN) {
           rte_pktmbuf_free(mbuf);
           continue;
         }
@@ -625,9 +630,6 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         uint8_t is_req = GET_IS_REQ(kv_hdr->combined);
         std::string_view key(kv_hdr->key.data(), KEY_LENGTH);
 
-        // 映射到连接: db_id % 16
-        const uint32_t conn_idx = db_id % REDIS_CONNS_PER_WORKER;
-
         // 构建 key 前缀: db{db_id}:{key}
         std::string prefixed_key =
             "db" + std::to_string(db_id) + ":" + std::string(key);
@@ -635,6 +637,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         if (GET_OP(kv_hdr->combined) == WRITE_REQUEST) {
           std::string_view value(kv_hdr->value1.data(), VALUE_LENGTH * 4);
 
+          // CACHE_MIGRATE：立即发送，不需要回复
           if (is_req == CACHE_MIGRATE) {
             auto* kv_migrate =
                 rte_pktmbuf_mtod_offset(mbuf, KVMigrate*, KV_HEADER_OFFSET);
@@ -647,11 +650,12 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
             auto db_req = std::make_shared<redis::request>();
             db_req->push("SET", prefixed_key, value);
 
-            inflight.fetch_add(1, std::memory_order_relaxed);
+            conn_inflight[conn_idx].fetch_add(1, std::memory_order_relaxed);
             conns[conn_idx]->async_exec(
                 *db_req, redis::ignore,
-                [db_req, &inflight, lcore_id](auto ec, auto) {
-                  inflight.fetch_sub(1, std::memory_order_relaxed);
+                [db_req, conn_idx, &conn_inflight, lcore_id](auto ec, auto) {
+                  conn_inflight[conn_idx].fetch_sub(1,
+                                                    std::memory_order_relaxed);
                   if (ec) {
                     RTE_LOG(ERR, DB, "[core %u] Redis WRITE error: %s\n",
                             lcore_id, ec.message().c_str());
@@ -660,17 +664,19 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
             continue;
           }
 
-          // 普通 WRITE：单独发送（不进 pipeline）
+          // 普通 WRITE：单独发送
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
 
           auto db_req = std::make_shared<redis::request>();
           db_req->push("SET", prefixed_key, value);
 
-          inflight.fetch_add(1, std::memory_order_relaxed);
+          conn_inflight[conn_idx].fetch_add(1, std::memory_order_relaxed);
           conns[conn_idx]->async_exec(
               *db_req, redis::ignore,
-              [mbuf, db_req, tx_ring, &inflight, lcore_id](auto ec, auto) {
-                inflight.fetch_sub(1, std::memory_order_relaxed);
+              [mbuf, db_req, tx_ring, conn_idx, &conn_inflight, lcore_id](
+                  auto ec, auto) {
+                conn_inflight[conn_idx].fetch_sub(1,
+                                                  std::memory_order_relaxed);
                 if (ec) {
                   RTE_LOG(ERR, DB, "[core %u] Redis WRITE error: %s\n",
                           lcore_id, ec.message().c_str());
@@ -686,7 +692,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           // READ：累积到 batch，等 MGET 批量发送
           kv_hdr->combined = (kv_hdr->combined & 0x0F) | (SERVER_REPLY << 4);
 
-          auto& batch = batches[conn_idx];
+          auto& batch = read_batches[conn_idx];
           if (batch.mbufs.empty()) {
             batch.first_arrival = now;
           }
@@ -696,9 +702,11 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           batch.timestamps.push_back(
               std::chrono::steady_clock::now().time_since_epoch().count());
 
+          conn_inflight[conn_idx].fetch_add(1, std::memory_order_relaxed);
+
           // 达到批量大小，立即刷新
-          if (batch.mbufs.size() >= BURST_SIZE) {
-            flush_batch(conn_idx);
+          if (batch.mbufs.size() >= READ_BATCH_SIZE) {
+            flush_read_batch(conn_idx);
           }
         }
       }
@@ -710,9 +718,9 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   }
 
   // 退出前刷新所有 pending batches
-  for (auto i : range(REDIS_CONNS_PER_WORKER)) {
-    if (!batches[i].mbufs.empty()) {
-      flush_batch(i);
+  for (uint32_t i = 0; i < REDIS_CONNS_PER_WORKER; i++) {
+    if (!read_batches[i].mbufs.empty()) {
+      flush_read_batch(i);
     }
   }
 
