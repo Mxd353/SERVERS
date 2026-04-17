@@ -480,6 +480,7 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
   struct PipelineBatch {
     std::vector<rte_mbuf*> mbufs;
     std::vector<std::string> keys;
+    std::vector<uint64_t> timestamps;  // 每个请求的时间戳（纳秒）
     std::chrono::steady_clock::time_point first_arrival;
   };
 
@@ -494,12 +495,16 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
         std::make_shared<std::vector<rte_mbuf*>>(std::move(batch.mbufs));
     auto keys =
         std::make_shared<std::vector<std::string>>(std::move(batch.keys));
+    auto timestamps =
+        std::make_shared<std::vector<uint64_t>>(std::move(batch.timestamps));
 
     batch.mbufs.clear();
     batch.keys.clear();
+    batch.timestamps.clear();
     batch.first_arrival = {};
 
-    inflight.fetch_add(mbufs->size(), std::memory_order_relaxed);
+    const size_t batch_size = mbufs->size();
+    inflight.fetch_add(batch_size, std::memory_order_relaxed);
 
     // 使用 push_range 构建 MGET 请求
     auto db_req = std::make_shared<redis::request>();
@@ -510,7 +515,8 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
     conns[conn_idx]->async_exec(
         *db_req, *resp,
-        [mbufs, keys, resp, tx_ring, &inflight, lcore_id](auto ec, auto) {
+        [mbufs, keys, timestamps, resp, tx_ring, &inflight, lcore_id](
+            auto ec, auto) {
           inflight.fetch_sub(mbufs->size(), std::memory_order_relaxed);
 
           if (ec) {
@@ -521,10 +527,20 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           }
 
           auto& results = std::get<0>(*resp).value();
+          const auto end_time = std::chrono::steady_clock::now().time_since_epoch().count();
 
+          size_t completed = 0;
           for (size_t i = 0; i < mbufs->size() && i < results.size(); i++) {
             auto* m = (*mbufs)[i];
             auto& val = results[i];
+
+            // 延迟统计
+            if (i < timestamps->size()) {
+              uint64_t latency_ns = end_time - (*timestamps)[i];
+              total_latency_us.fetch_add(latency_ns / 1000,
+                                         std::memory_order_relaxed);
+            }
+            completed++;
 
             if (!val.has_value() || val->empty()) {
               rte_pktmbuf_free(m);
@@ -541,9 +557,19 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
             if (ret != 0) rte_pktmbuf_free(m);
           }
 
-          for (auto i : range(results.size(), mbufs->size())) {
+          // 处理多余的 mbufs
+          for (size_t i = results.size(); i < mbufs->size(); i++) {
+            if (i < timestamps->size()) {
+              uint64_t latency_ns = end_time - (*timestamps)[i];
+              total_latency_us.fetch_add(latency_ns / 1000,
+                                         std::memory_order_relaxed);
+            }
+            completed++;
             rte_pktmbuf_free((*mbufs)[i]);
           }
+
+          completed_request_count.fetch_add(completed,
+                                            std::memory_order_relaxed);
         });
   };
 
@@ -567,12 +593,8 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     // 检查是否需要刷新 batches
     for (auto i : range(REDIS_CONNS_PER_WORKER)) {
       auto& batch = batches[i];
-      bool should_flush =
-          batch.mbufs.size() >= BURST_SIZE ||
-          (batch.mbufs.size() > 0 &&
-           now - batch.first_arrival >= PIPELINE_FLUSH_INTERVAL);
-
-      if (should_flush) {
+      if (batch.mbufs.size() > 0 &&
+          now - batch.first_arrival >= PIPELINE_FLUSH_INTERVAL) {
         flush_batch(i);
       }
     }
@@ -671,6 +693,8 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
 
           batch.mbufs.push_back(mbuf);
           batch.keys.push_back(prefixed_key);
+          batch.timestamps.push_back(
+              std::chrono::steady_clock::now().time_since_epoch().count());
 
           // 达到批量大小，立即刷新
           if (batch.mbufs.size() >= BURST_SIZE) {
