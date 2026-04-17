@@ -41,8 +41,9 @@ constexpr uint32_t TOTAL_DB_NUM = DB_PER_RACK * NUM_RACKS;
 constexpr uint32_t DBS_PER_WORKER = TOTAL_DB_NUM / WORKER_CORE_NUM;
 constexpr uint32_t REDIS_CONNS_PER_WORKER = 16;
 constexpr uint32_t MAX_INFLIGHT_PER_CONN = 512;
+constexpr uint32_t HIGH_WATERMARK = 0.7 * MAX_INFLIGHT_PER_CONN;
 constexpr uint32_t READ_BATCH_SIZE = BURST_SIZE;
-constexpr auto READ_FLUSH_INTERVAL = std::chrono::milliseconds(1);
+constexpr uint64_t READ_FLUSH_INTERVAL_US = 1000;  // 1ms in microseconds
 constexpr const char* REDIS_SOCKET_PATH = "/tmp/redis.";
 
 extern std::atomic<uint32_t> next_db_id;
