@@ -1,1 +1,4 @@
-sudo -E LD_LIBRARY_PATH=/home/mxd/gcc/lib64:/home/mxd/lib/dpdk/lib/x86_64-linux-gnu ./run
+python3 ./redis/generate_redis_confs.py
+python3 ./redis/start_all_redis.py 
+./run.sh
+python3 ./redis/stop_all_redis.py 

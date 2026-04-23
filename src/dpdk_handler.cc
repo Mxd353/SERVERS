@@ -516,20 +516,19 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     auto resp = std::make_shared<
         redis::response<std::vector<std::optional<std::string>>>>();
 
-    conn_states[conn_idx].inflight.fetch_add(1, std::memory_order_relaxed);
-
     conn_states[conn_idx].conn->async_exec(
         *db_req, *resp,
         [mbufs = std::move(mbufs), keys = std::move(keys),
          timestamps = std::move(timestamps), resp, tx_ring, &conn_states,
          conn_idx, lcore_id](auto ec, auto) {
-          conn_states[conn_idx].inflight.fetch_sub(1,
-                                                   std::memory_order_relaxed);
-
           if (ec) {
             RTE_LOG(ERR, DB, "[core %u] Redis MGET error: %s\n", lcore_id,
                     ec.message().c_str());
-            for (auto* m : mbufs) rte_pktmbuf_free(m);
+            for (auto* m : mbufs) {
+              conn_states[conn_idx].inflight.fetch_sub(1,
+                                                        std::memory_order_relaxed);
+              rte_pktmbuf_free(m);
+            }
             return;
           }
 
@@ -541,6 +540,9 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           for (size_t i = 0; i < mbufs.size() && i < results.size(); i++) {
             auto* m = mbufs[i];
             auto& val = results[i];
+
+            conn_states[conn_idx].inflight.fetch_sub(1,
+                                                      std::memory_order_relaxed);
 
             if (i < timestamps.size()) {
               uint64_t latency_us =
@@ -565,6 +567,8 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           }
 
           for (size_t i = results.size(); i < mbufs.size(); i++) {
+            conn_states[conn_idx].inflight.fetch_sub(1,
+                                                      std::memory_order_relaxed);
             if (i < timestamps.size()) {
               uint64_t latency_us =
                   (end_tsc - timestamps[i]) * 1000000ULL / tsc_hz;
@@ -716,6 +720,9 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
           batch.keys.push_back(prefixed_key);
           batch.timestamps.push_back(rte_rdtsc());
 
+          conn_states[conn_idx].inflight.fetch_add(1,
+                                                    std::memory_order_relaxed);
+
           // 达到批量大小，立即刷新
           if (batch.mbufs.size() >= READ_BATCH_SIZE) {
             flush_read_batch(conn_idx);
@@ -734,6 +741,18 @@ void DPDKHandler::DBWorker(CoreInfo core_info) {
     if (!conn_states[i].read_batch.mbufs.empty()) {
       flush_read_batch(i);
     }
+  }
+
+  // 等待所有 inflight 请求完成（最多等待 1 秒）
+  int wait_ms = 0;
+  while (wait_ms < 1000) {
+    uint32_t total_inflight = 0;
+    for (auto& cs : conn_states) {
+      total_inflight += cs.inflight.load(std::memory_order_relaxed);
+    }
+    if (total_inflight == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    wait_ms++;
   }
 
   work_guard.reset();

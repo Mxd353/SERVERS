@@ -7,7 +7,7 @@ All data is stored in the script's directory.
 from pathlib import Path
 
 # ========== 可修改区域 ==========
-INSTANCE_COUNT = 1024
+INSTANCE_COUNT = 128
 # 使用脚本所在目录作为基础目录
 BASE_DIR = Path(__file__).parent / 'data'
 TEMPLATE_CONF = Path(__file__).parent / 'base_redis.conf'

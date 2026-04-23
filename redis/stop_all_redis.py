@@ -71,16 +71,16 @@ def stop_redis(pidfile: Path, log_file: Path) -> bool:
             log_message(log_file, f"PID file not found: {pidfile}")
             update_count()
             return True
-        
+
         pid = int(pidfile.read_text().strip())
-        
+
         if not is_process_running(pid):
             log_message(log_file, f"PID {pid} in {pidfile} not running")
             update_count()
             return True
-        
+
         log_message(log_file, f"Stopping Redis (pid {pid}) from {pidfile}")
-        
+
         try:
             os.kill(pid, 15)  # SIGTERM
             # Wait a bit for graceful shutdown
@@ -88,18 +88,18 @@ def stop_redis(pidfile: Path, log_file: Path) -> bool:
                 if not is_process_running(pid):
                     break
                 time.sleep(0.1)
-            
+
             # Force kill if still running
             if is_process_running(pid):
                 log_message(log_file, f"Force killing Redis (pid {pid})")
                 os.kill(pid, 9)  # SIGKILL
-                
+
         except (OSError, ProcessLookupError) as e:
             log_message(log_file, f"Error stopping PID {pid}: {e}")
-        
+
     except (ValueError, IOError) as e:
         log_message(log_file, f"Error reading {pidfile}: {e}")
-    
+
     update_count()
     return True
 
@@ -125,31 +125,31 @@ def print_progress(current: int, total: int):
 def main():
     """Main entry point."""
     start_time = datetime.now()
-    
+
     # Initialize log
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG_FILE, "w") as f:
         f.write(f"Stopping all Redis instances at {start_time}...\n")
-    
+
     print(f"Stopping all Redis instances at {start_time}...")
     log_message(LOG_FILE, f"Stopping all Redis instances at {start_time}")
-    
+
     # Find all PID files
     pid_pattern = PID_DIR / "redis_*.pid"
     pidfiles = sorted(glob.glob(str(pid_pattern)))
     total = len(pidfiles)
-    
+
     if total == 0:
         print(f"⚠️  No PID files found in {PID_DIR}")
         log_message(LOG_FILE, f"No PID files found in {PID_DIR}")
         sys.exit(0)
-    
+
     print(f"Found {total} Redis PID files")
     log_message(LOG_FILE, f"Found {total} PID files to stop")
-    
+
     # Initialize counter
     LOCK_FILE.write_text("0")
-    
+
     # Progress display thread
     def progress_monitor():
         while True:
@@ -158,21 +158,21 @@ def main():
             print_progress(current, total)
             if current >= total:
                 break
-    
+
     import threading
     progress_thread = threading.Thread(target=progress_monitor)
     progress_thread.daemon = True
     progress_thread.start()
-    
+
     # Stop all Redis instances in parallel
     completed = 0
-    
+
     with ThreadPoolExecutor(max_workers=min(32, total)) as executor:
         future_to_pidfile = {
-            executor.submit(stop_redis, Path(pidfile), LOG_FILE): pidfile 
+            executor.submit(stop_redis, Path(pidfile), LOG_FILE): pidfile
             for pidfile in pidfiles
         }
-        
+
         for future in as_completed(future_to_pidfile):
             pidfile = future_to_pidfile[future]
             try:
@@ -180,23 +180,23 @@ def main():
                 completed += 1
             except Exception as e:
                 print(f"\n❌ Exception stopping {pidfile}: {e}")
-    
+
     # Wait for progress bar to finish
     progress_thread.join(timeout=2)
     print_progress(total, total)
-    
+
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
-    
+
     # Cleanup
     LOCK_FILE.unlink(missing_ok=True)
     LOCK_FILE_META.unlink(missing_ok=True)
-    
+
     # Summary
     summary = f"\n✅ All Redis shutdown attempts finished at {end_time}"
     summary += f"\n   Total: {total}, Completed: {completed}"
     summary += f"\n   Duration: {duration:.2f} seconds"
-    
+
     print(summary)
     log_message(LOG_FILE, summary)
 
